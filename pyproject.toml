@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msgspec-fastapi"
+version = "0.0.1"
+description = "Experimental FastAPI router that decodes request bodies and encodes responses with msgspec"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.142.2,<0.144",
+    "msgspec>=0.22.0",
+]
+
+[project.urls]
+Source = "https://github.com/msgspec/msgspec-fastapi"
+
+[dependency-groups]
+test = ["pytest", "httpx", "httpx2"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/msgspec_fastapi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
