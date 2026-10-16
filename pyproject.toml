@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.urls]
-Source = "https://github.com/msgspec/msgspec-fastapi"
+Source = "https://github.com/Siyet/msgspec-fastapi"
 
 [dependency-groups]
 test = ["pytest", "httpx", "httpx2"]
