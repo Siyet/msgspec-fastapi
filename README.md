@@ -3,8 +3,8 @@
 An experimental FastAPI router that uses msgspec for JSON request bodies and responses.
 
 This is a prototype. It is not published on PyPI, its API may change, and it relies on
-private FastAPI internals, so it is pinned to FastAPI 0.142.2 to 0.143.x. It is not an
-official msgspec release; feedback is welcome in the issues.
+private FastAPI internals, so it is pinned to FastAPI 0.142.2 to 0.143.x. It is a
+personal project, not part of msgspec; feedback is welcome in the issues.
 
 ## Usage
 
