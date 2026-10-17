@@ -71,9 +71,13 @@ revalidation.
 - Host: a cloud VM with 6 dedicated vCPUs (AMD EPYC-Rome, KVM), Ubuntu 24.04. The API
   ran as one uvicorn worker (h11, asyncio) pinned to one core; PostgreSQL and the load
   generator ran on other cores.
+- Data and database: 224,578 cities, 55,246 division records, 501 country records and
+  86,185 airports from GeoNames and OurAirports, about 231 MB in PostgreSQL 18.6
+  including indexes. The PostgreSQL data directory was on tmpfs (in memory). Database
+  access went through the SQLAlchemy ORM with the asyncpg driver.
 - Software: CPython 3.14.7, FastAPI 0.142.2, Pydantic 2.13.5, msgspec 0.22.0,
-  SQLAlchemy 2.1.3 (ORM), uvicorn 0.54.0. The router code on the measured paths was
-  the same as msgspec-fastapi 0.0.1.
+  SQLAlchemy 2.1.3 (ORM), asyncpg 0.31.0, uvicorn 0.54.0. The router code on the
+  measured paths was the same as msgspec-fastapi 0.0.1.
 - Load: a Go generator with 20 closed-loop clients, checking every response body. The
   numbers are throughput at saturation of the single API core. The GET mix sends 9 of
   10 requests to one page and every 10th to a page that is not repeated within the run.
@@ -85,7 +89,8 @@ revalidation.
 - CPU time per response is the CPU time of the API container in the measurement
   window divided by the number of checked responses. Because the API core was
   saturated, it is close to the inverse of throughput.
-- The benchmark sources are not published yet.
+- The benchmark sources, the data preparation scripts and the analysed results are in
+  [world-directory-bench](https://github.com/Siyet/world-directory-bench).
 
 </details>
 
@@ -100,10 +105,10 @@ Things to keep in mind:
   in Python. Results for other schemas and other routes will differ.
 - This is one series on one machine. The host slowed down near the end of the series: a
   static control was about 10% slower after the series than before it. The blocks of
-  all comparisons ran in 8 rounds, and the slowdown began during the last round, so
-  only the last block of each comparison can be affected. Excluding it changes each
-  estimate by less than 0.2 percentage points. Compare the relative effects rather than
-  the absolute numbers.
+  all comparisons ran in 8 rounds, and the lasting slowdown began during the last
+  round. Leaving out any single round, the last one included, changes each estimate by
+  less than 0.32 percentage points. Compare the relative effects rather than the
+  absolute numbers.
 
 ## What it does
 
