@@ -26,7 +26,7 @@ Source = "https://github.com/Siyet/msgspec-fastapi"
 Issues = "https://github.com/Siyet/msgspec-fastapi/issues"
 
 [dependency-groups]
-test = ["pytest", "httpx", "httpx2"]
+test = ["pytest", "httpx", "httpx2", "python-multipart"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/msgspec_fastapi"]
