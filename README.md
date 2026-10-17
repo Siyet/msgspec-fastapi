@@ -1,6 +1,9 @@
 # msgspec-fastapi
 
 An experimental FastAPI router that uses msgspec for JSON request bodies and responses.
+In one benchmark service, moving from Pydantic models to msgspec Structs with this router
+increased throughput by 68% on a route with a large JSON body and by 11% to 13% on
+database-backed routes; see the Benchmarks section below.
 
 This is a prototype. Its API may change, and it relies on private FastAPI internals, so
 it is pinned to FastAPI 0.142.2 to 0.143.x. It is a personal project, not part of
@@ -37,6 +40,70 @@ app = FastAPI()
 app.include_router(router)
 install_openapi(app, router)
 ```
+
+## Benchmarks
+
+The router was measured in a small reference-data service on a cloud VM with dedicated
+vCPUs (October 2026). Each row compares the same service on FastAPI with Pydantic models
+against the same service with msgspec Structs and `MsgspecRouter`. The database queries
+(SQLAlchemy ORM), event loop and server settings are the same on both sides, and there
+is no cache.
+
+| Request | Requests per second | RPS change | CPU time per response | CPU change |
+|---|---|---|---|---|
+| `POST /cities/validate`, a JSON body of 100 cities (23 KB), no database | 1,610 → 2,703 | **+67.9%** [+67.0%, +68.7%] | 621 → 370 µs | **-40.4%** [-40.7%, -40.1%] |
+| `GET /cities?limit=100`, a page of 100 cities read from PostgreSQL | 514 → 569 | **+10.7%** [+9.9%, +11.5%] | 1,944 → 1,757 µs | **-9.7%** [-10.3%, -9.0%] |
+| `POST /cities/search`, small JSON filter bodies, a page of 100 cities | 447 → 505 | **+12.9%** [+12.1%, +13.7%] | 2,237 → 1,981 µs | **-11.4%** [-12.1%, -10.8%] |
+
+The first route returns a constant 16-byte response (`{"accepted":100}`), so the
+difference on this route comes mostly from request decoding and validation, and the gain
+is largest there. On routes that read from a database, API CPU time per response falls by
+about 190 to 260 µs out of roughly 2 ms, so the relative gain is smaller.
+
+In the same service, setting `response_model=None` on the GET route made no detectable
+difference in throughput with `MsgspecRouter` (0.0% [-1.0%, +1.0%]). This is consistent
+with an instance of exactly the declared Struct class being encoded without
+revalidation.
+
+<details>
+<summary>How it was measured</summary>
+
+- Host: a cloud VM with 6 dedicated vCPUs (AMD EPYC-Rome, KVM), Ubuntu 24.04. The API
+  ran as one uvicorn worker (h11, asyncio) pinned to one core; PostgreSQL and the load
+  generator ran on other cores.
+- Software: CPython 3.14.7, FastAPI 0.142.2, Pydantic 2.13.5, msgspec 0.22.0,
+  SQLAlchemy 2.1.3 (ORM), uvicorn 0.54.0. The router code on the measured paths was
+  the same as msgspec-fastapi 0.0.1.
+- Load: a Go generator with 20 closed-loop clients, checking every response body. The
+  numbers are throughput at saturation of the single API core. The GET mix sends 9 of
+  10 requests to one page and every 10th to a page that is not repeated within the run.
+- Each comparison is 8 blocks in ABBA or BAAB order, so each block measures both
+  versions twice; every run starts a fresh process with a 30 s warmup and a 60 s
+  measurement. The percentages are computed from the mean of the per-block log ratios,
+  with a nominal 95% t interval over the 8 blocks. The requests per second values are
+  the geometric means of each side, and the CPU values are the arithmetic means.
+- CPU time per response is the CPU time of the API container in the measurement
+  window divided by the number of checked responses. Because the API core was
+  saturated, it is close to the inverse of throughput.
+- The benchmark sources are not published yet.
+
+</details>
+
+Things to keep in mind:
+
+- On the control side, FastAPI parses the body with `json.loads` and then validates
+  it with Pydantic, which is FastAPI's standard path.
+- The GET and search rows also include changes outside the router: database rows are
+  converted to msgspec Structs instead of Pydantic models and, for GET, the query model is
+  msgspec instead of Pydantic, so they measure a migration, not the router alone.
+- Both sides check the same constraints, including custom per-record checks written
+  in Python. Results for other schemas and other routes will differ.
+- This is one series on one machine. The host slowed down near the end of the series: a
+  static control was about 10% slower after the series than before it. The blocks of
+  all comparisons ran in 8 rounds, and the slowdown began during the last round, so
+  only the last block of each comparison can be affected. Excluding it changes each
+  estimate by less than 0.2 percentage points. Compare the relative effects rather than
+  the absolute numbers.
 
 ## What it does
 
