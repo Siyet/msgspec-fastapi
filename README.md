@@ -65,6 +65,11 @@ difference in throughput with `MsgspecRouter` (0.0% [-1.0%, +1.0%]). This is con
 with an instance of exactly the declared Struct class being encoded without
 revalidation.
 
+The benchmark sources, the data preparation scripts and the results of all 14
+comparisons, including direct asyncpg queries without the ORM, uvloop, a Redis cache,
+Litestar and Go, are in
+[world-directory-bench](https://github.com/Siyet/world-directory-bench).
+
 <details>
 <summary>How it was measured</summary>
 
@@ -89,8 +94,6 @@ revalidation.
 - CPU time per response is the CPU time of the API container in the measurement
   window divided by the number of checked responses. Because the API core was
   saturated, it is close to the inverse of throughput.
-- The benchmark sources, the data preparation scripts and the analysed results are in
-  [world-directory-bench](https://github.com/Siyet/world-directory-bench).
 
 </details>
 
