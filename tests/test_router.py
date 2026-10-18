@@ -1,9 +1,10 @@
 """Tests for MsgspecRouter request decoding, parameter validation and response encoding."""
-from typing import Annotated, Generic, TypeVar
+from typing import Annotated, Any, Generic, TypeVar
 
 import msgspec
 import pytest
-from fastapi import APIRouter, Depends, FastAPI, Query, Response
+from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Response
+from fastapi.exceptions import ResponseValidationError
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
@@ -319,3 +320,224 @@ def test_scalar_query_coercion_matches_fastapi(annotation, value):
     assert actual.status_code == expected.status_code
     if expected.status_code == 200:
         assert actual.json() == expected.json()
+
+
+def strict_content_type_app(level, strict):
+    calls = []
+
+    def dependency():
+        calls.append(1)
+
+    async def endpoint(city: City):
+        return city
+
+    app = FastAPI(**({'strict_content_type': strict} if level == 'app' else {}))
+    router = MsgspecRouter(**({'strict_content_type': strict} if level == 'router' else {}))
+    router.add_api_route('/value', endpoint, methods=['POST'], dependencies=[Depends(dependency)],
+                         **({'strict_content_type': strict} if level == 'route' else {}))
+    app.include_router(router)
+    return TestClient(app, raise_server_exceptions=False), calls
+
+
+@pytest.mark.parametrize('level', ['app', 'router', 'route'])
+@pytest.mark.parametrize('strict', [True, False])
+def test_body_without_content_type_follows_strict_content_type(level, strict):
+    client, calls = strict_content_type_app(level, strict)
+    result = client.post('/value', content=b'{"population": 1}')
+    assert 'content-type' not in result.request.headers
+    if strict:
+        assert result.status_code == 415 and calls == []
+    else:
+        assert result.status_code == 200 and result.json() == {'population': 1}
+
+
+def test_route_strict_content_type_overrides_app():
+    app = FastAPI(strict_content_type=False)
+    router = MsgspecRouter()
+
+    async def endpoint(city: City):
+        return city
+
+    router.add_api_route('/value', endpoint, methods=['POST'], strict_content_type=True)
+    app.include_router(router)
+    result = TestClient(app, raise_server_exceptions=False).post('/value', content=b'{"population": 1}')
+    assert result.status_code == 415
+
+
+@pytest.mark.parametrize('content_type', ['', ';', 'text/plain', 'application/x-www-form-urlencoded'])
+def test_body_with_non_json_content_type_is_rejected(content_type):
+    client, calls = strict_content_type_app('app', False)
+    result = client.post('/value', content=b'{"population": 1}', headers={'Content-Type': content_type})
+    expected = 200 if content_type == '' else 415
+    assert result.status_code == expected
+    assert calls == ([1] if expected == 200 else [])
+
+
+@pytest.mark.parametrize('content_type', ['application/json; charset=utf-8', 'application/merge-patch+json'])
+def test_body_with_json_content_type_is_accepted(content_type):
+    client, _ = strict_content_type_app('app', True)
+    result = client.post('/value', content=b'{"population": 1}', headers={'Content-Type': content_type})
+    assert result.status_code == 200 and result.json() == {'population': 1}
+
+
+@pytest.mark.parametrize('annotation', [City, list[int], list[Any]])
+def test_deeply_nested_json_body_is_rejected(annotation):
+    router = MsgspecRouter()
+
+    async def endpoint(value: annotation):
+        return {}
+
+    router.add_api_route('/value', endpoint, methods=['POST'])
+    app = FastAPI()
+    app.include_router(router)
+    depth = 200_000
+    result = TestClient(app, raise_server_exceptions=False).post(
+        '/value', content=b'[' * depth + b']' * depth, headers={'Content-Type': 'application/json'})
+    assert result.status_code == 400
+
+
+class Reading(msgspec.Struct):
+    value: float
+
+
+class LabeledReading(Reading):
+    label: str = ''
+
+
+@pytest.mark.parametrize('annotation,value,expected', [
+    (float, float('nan'), None),
+    (float, float('inf'), None),
+    (dict[str, float], {'a': float('-inf')}, {'a': None}),
+    (Reading, LabeledReading(float('nan'), 'x'), {'value': None}),
+    (list[Reading], [Reading(float('nan'))], [{'value': None}]),
+    (dict[str, float], {1: float('nan')}, {'1': None}),
+    (dict[int, float], {'1': float('nan')}, {'1': None}),
+])
+def test_non_finite_floats_in_typed_response_are_encoded_as_null(annotation, value, expected):
+    # FastAPI with Pydantic also encodes these as null instead of failing.
+    result = response(setup(value, model=annotation))
+    assert result.status_code == 200 and result.json() == expected
+
+
+class Measurement(msgspec.Struct):
+    value: float
+    count: int
+
+
+@pytest.mark.parametrize('annotation,value,message', [
+    (Annotated[float, msgspec.Meta(ge=0)], float('nan'), 'Expected `float` >= 0.0'),
+    (Annotated[float, msgspec.Meta(ge=0)], float('-inf'), 'Expected `float` >= 0.0'),
+    (Measurement, {'value': float('nan'), 'count': 'x'}, 'Expected `int`, got `str` - at `$.count`'),
+    (Reading, {'value': 'x'}, 'Expected `float`, got `str` - at `$.value`'),
+    (float, 'nan', 'Expected `float`, got `str`'),
+    (float, msgspec.Raw(b'"x"'), 'Expected `float`, got `str`'),
+])
+def test_invalid_typed_response_is_still_rejected(annotation, value, message):
+    router = MsgspecRouter()
+
+    async def endpoint():
+        return value
+
+    router.add_api_route('/value', endpoint, methods=['GET'], response_model=annotation)
+    app = FastAPI()
+    app.include_router(router)
+    with pytest.raises(ResponseValidationError) as info:
+        TestClient(app).get('/value')
+    assert info.value.errors()[0]['msg'] == message
+
+
+def auth_app():
+    calls = []
+
+    def authenticate(token: Annotated[str | None, Header()] = None):
+        calls.append(token)
+        if token != 'secret':
+            raise HTTPException(401, 'Not authenticated')
+
+    router = MsgspecRouter()
+
+    @router.post('/value', dependencies=[Depends(authenticate)])
+    async def endpoint(city: City):
+        return city
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app, raise_server_exceptions=False), calls
+
+
+@pytest.mark.parametrize('body', [{'population': -1}, {}, None])
+def test_body_validation_errors_are_reported_after_dependencies(body):
+    # As in FastAPI, a failing dependency such as authentication takes precedence over
+    # a body that does not match the schema.
+    client, calls = auth_app()
+    options = {} if body is None else {'json': body}
+    assert client.post('/value', **options).status_code == 401
+    assert calls == [None]
+    result = client.post('/value', headers={'token': 'secret'}, **options)
+    assert result.status_code == 422
+    assert result.json()['detail'][0]['loc'] == ['body']
+
+
+def test_malformed_body_is_still_rejected_before_dependencies():
+    client, calls = auth_app()
+    assert client.post('/value', content=b'{', headers={'Content-Type': 'application/json'}).status_code == 400
+    assert calls == []
+
+
+@pytest.mark.parametrize('router_class', [APIRouter, MsgspecRouter])
+def test_none_return_annotation_declares_no_response_model(router_class):
+    router = router_class()
+
+    @router.delete('/value', status_code=204)
+    async def delete() -> None:
+        pass
+
+    @router.get('/value')
+    async def get() -> None:
+        pass
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    deleted = client.delete('/value')
+    assert deleted.status_code == 204 and deleted.content == b''
+    assert client.get('/value').json() is None
+    responses = app.openapi()['paths']['/value']['get']['responses']
+    assert responses['200']['content']['application/json']['schema'] == {}
+
+
+def test_form_and_file_parameters_are_left_to_fastapi():
+    router = MsgspecRouter()
+
+    @router.post('/value')
+    async def endpoint(name: Annotated[str, Form()], data: Annotated[bytes, File()]):
+        return {'name': name, 'size': len(data)}
+
+    app = FastAPI()
+    app.include_router(router)
+    result = TestClient(app).post('/value', data={'name': 'x'}, files={'data': b'abc'})
+    assert result.status_code == 200 and result.json() == {'name': 'x', 'size': 3}
+
+
+def test_struct_form_parameter_is_rejected():
+    router = MsgspecRouter()
+
+    async def endpoint(city: Annotated[City, Form()]):
+        return city
+
+    with pytest.raises(TypeError, match='Form or File'):
+        router.add_api_route('/value', endpoint, methods=['POST'])
+
+
+@pytest.mark.parametrize('annotation,value', [(str, '\ud800'), (Any, {None: 1})])
+def test_unencodable_typed_response_raises_response_validation_error(annotation, value):
+    router = MsgspecRouter()
+
+    async def endpoint():
+        return value
+
+    router.add_api_route('/value', endpoint, methods=['GET'], response_model=annotation)
+    app = FastAPI()
+    app.include_router(router)
+    with pytest.raises(ResponseValidationError):
+        TestClient(app).get('/value')

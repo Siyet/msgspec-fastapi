@@ -41,18 +41,27 @@ install_openapi(app, router)
 ## What it does
 
 - A msgspec body parameter (a Struct or another type msgspec can decode) is decoded from
-  the raw request bytes by a `msgspec.json.Decoder` built once at route registration.
-  A non-JSON content type returns 415, malformed JSON returns 400, and a missing or
-  invalid body returns 422. Bodies are decoded in msgspec strict mode: for example, the
-  JSON string `"1"` is not accepted for an `int` field, unlike FastAPI with Pydantic.
+  the raw request bytes by a `msgspec.json.Decoder` built once at route registration. A
+  body with a non-JSON content type returns 415, malformed JSON or JSON nested too deeply
+  returns 400, and a missing or invalid body returns 422. The 415 and 400 responses are
+  sent before dependencies run; a 422 is sent after them, as in FastAPI, so a failing
+  dependency such as authentication takes precedence. Bodies are decoded in msgspec
+  strict mode: for example, the JSON string `"1"` is not accepted for an `int` field,
+  unlike FastAPI with Pydantic.
+- A body without a content type follows FastAPI's `strict_content_type` setting: it is
+  rejected with 415 by default and parsed as JSON when the setting is `False`. FastAPI
+  returns 422 in the first case.
 - A msgspec response type, from the return annotation or `response_model`, is encoded
   with msgspec. An instance of exactly the declared Struct class is encoded without
   revalidation, as FastAPI does for a Pydantic `response_model`; other values are
   validated against the declared type. Nested values and type parameters of a trusted
-  instance are not checked.
-- Responses of routes without a return annotation or `response_model` are also encoded
-  with msgspec, so the output can differ from FastAPI's `jsonable_encoder` (for example,
-  `bytes` are base64-encoded and `Decimal` is encoded as a string).
+  instance are not checked. A NaN or infinite value in a `float` field is encoded as
+  `null` unless a constraint rejects it. In a `Decimal` field it is encoded as a string,
+  while FastAPI with Pydantic rejects non-finite `Decimal` values.
+- Responses of routes without a return annotation or `response_model`, or with
+  `-> None`, are also encoded with msgspec, so the output can differ from FastAPI's
+  `jsonable_encoder` (for example, `bytes` are base64-encoded and `Decimal` is encoded as
+  a string).
 - Path, query, header and cookie parameters keep FastAPI extraction, aliases and
   defaults, but are converted with `msgspec.convert(strict=False)` instead of Pydantic,
   so coercion differs for some inputs (for example, `" 1.5"` is rejected for `float`
@@ -68,9 +77,12 @@ install_openapi(app, router)
 
 - Only one msgspec body parameter per route, and it cannot be combined with other
   FastAPI body fields. Only JSON bodies are supported: `application/json`,
-  `application/*+json`, or a request without a content type.
+  `application/*+json`, or a request without a content type when `strict_content_type`
+  is `False`. `Form()` and `File()` parameters are left to FastAPI.
+- When both the parameters and the body are invalid, only the parameter errors are
+  returned; FastAPI returns both.
 - Structs, alone or inside containers, are not supported as path, query, header or
-  cookie parameters.
+  cookie parameters, or as `Form()` and `File()` parameters.
 - `response_model_include`, `response_model_exclude`, `response_model_exclude_*` and
   `response_model_by_alias=False` are rejected for typed msgspec responses.
 

@@ -12,7 +12,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.datastructures import DefaultPlaceholder
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.openapi.utils import validation_error_definition, validation_error_response_definition
-from fastapi.params import Body, Depends, Param
+from fastapi.params import Body, Depends, Form, Param
 from fastapi.routing import APIRoute, _effective_route_context_var, iter_route_contexts
 from starlette.concurrency import run_in_threadpool
 
@@ -85,16 +85,23 @@ def _hints(endpoint):
     return get_type_hints(target, include_extras=True)
 
 
-def _parse_body(request, raw, config):
+def _parse_body(request, raw, config, strict_content_type):
     decoder, default, embedded = config
     if not raw:
         if default is inspect.Signature.empty:
-            raise RequestValidationError([{'loc': ('body',), 'msg': 'Field required', 'type': 'missing'}])
+            # Raised after dependencies run, as in FastAPI.
+            return RequestValidationError([{'loc': ('body',), 'msg': 'Field required', 'type': 'missing'}])
         return deepcopy(default)
-    media_type = request.headers.get('content-type', '').split(';')[0].strip().lower()
-    if media_type and media_type != 'application/json' and not (
-        media_type.startswith('application/') and media_type.endswith('+json')
-    ):
+    content_type = request.headers.get('content-type')
+    if content_type:
+        media_type = content_type.split(';')[0].strip().lower()
+        if media_type != 'application/json' and not (
+            media_type.startswith('application/') and media_type.endswith('+json')
+        ):
+            raise HTTPException(415, 'Expected a JSON request body')
+    elif strict_content_type:
+        # Like FastAPI's strict_content_type: a body without a content type can be sent
+        # cross-origin without a CORS preflight, so it is not parsed as JSON.
         raise HTTPException(415, 'Expected a JSON request body')
     try:
         value = decoder.decode(raw)
@@ -104,10 +111,36 @@ def _parse_body(request, raw, config):
             msgspec.json.decode(raw)
         except (msgspec.DecodeError, UnicodeError) as syntax:
             raise HTTPException(400, f'Malformed JSON body: {syntax}') from syntax
-        raise RequestValidationError([{'loc': ('body',), 'msg': str(exc), 'type': 'value_error.msgspec'}]) from exc
+        except RecursionError as nested:
+            raise HTTPException(400, 'JSON body is nested too deeply') from nested
+        return RequestValidationError([{'loc': ('body',), 'msg': str(exc), 'type': 'value_error.msgspec'}])
     except (msgspec.DecodeError, UnicodeError) as exc:
         raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
+    except RecursionError as exc:
+        raise HTTPException(400, 'JSON body is nested too deeply') from exc
     return value.value if embedded else value
+
+
+def _revalidate_without_json(result, output_type, error):
+    """Validate a value whose JSON round trip failed, as for NaN and infinity.
+
+    JSON encodes non-finite floats as null, and null is not valid for a float field.
+    FastAPI with Pydantic encodes them as null in a response, so validate the Python
+    values instead, with object keys converted to strings. A validation error from this
+    check is reported, because the one from the JSON round trip can point at a
+    non-finite float instead of the actual problem. Values that cannot be encoded as
+    JSON are not revalidated.
+    """
+    if isinstance(error, msgspec.ValidationError):
+        try:
+            return msgspec.convert(msgspec.to_builtins(result, str_keys=True), output_type, str_keys=True)
+        except msgspec.ValidationError as exc:
+            error = exc
+        except TypeError:
+            # to_builtins does not support every value JSON encodes, such as msgspec.Raw.
+            pass
+    raise ResponseValidationError(
+        [{'loc': ('response',), 'msg': str(error), 'type': 'value_error.msgspec'}]) from error
 
 
 class MsgspecRoute(APIRoute):
@@ -122,9 +155,14 @@ class MsgspecRoute(APIRoute):
         if route.body_field is not None:
             raise TypeError('Other FastAPI body fields cannot be combined with a msgspec body')
 
+        strict_content_type = route.strict_content_type
+        if isinstance(strict_content_type, DefaultPlaceholder):
+            strict_content_type = strict_content_type.value
+
         async def handle(request):
-            # Invalid JSON must be rejected before dependency side effects.
-            request.scope['_msgspec_body_value'] = _parse_body(request, await request.body(), config)
+            # A body that is not JSON is rejected before dependency side effects.
+            request.scope['_msgspec_body_value'] = _parse_body(
+                request, await request.body(), config, strict_content_type)
             return await handler(request)
         return handle
 
@@ -194,13 +232,17 @@ class MsgspecRouter(APIRouter):
         override = kwargs.get('route_class_override')
         if override is not None and not issubclass(override, MsgspecRoute):
             raise TypeError('route_class_override must extend MsgspecRoute')
-        # Included routes already have a prepared signature and response metadata.
+        # Routes copied from another MsgspecRouter with add_api_route already have a
+        # prepared signature and response metadata.
         if getattr(endpoint, '_msgspec_prepared', False):
             return super().add_api_route(path, endpoint, **kwargs)
         signature = inspect.signature(endpoint)
         hints = _hints(endpoint)
         parameters = [p.replace(annotation=hints.get(p.name, p.annotation)) for p in signature.parameters.values()]
         return_type = hints.get('return', signature.return_annotation)
+        if return_type is type(None):
+            # As in FastAPI, `-> None` declares no response model.
+            return_type = None
         explicit = kwargs.get('response_model', inspect.Signature.empty)
         inferred = explicit is inspect.Signature.empty or isinstance(explicit, DefaultPlaceholder)
         output_type = return_type if inferred else explicit
@@ -240,6 +282,11 @@ class MsgspecRouter(APIRouter):
         for parameter in parameters:
             metadata = _metadata(parameter, parameter.annotation)
             if any(isinstance(x, Depends) for x in metadata):
+                continue
+            # Form and File parameters are left to FastAPI.
+            if any(isinstance(x, Form) for x in metadata):
+                if _contains_struct(parameter.annotation):
+                    raise TypeError('msgspec Structs are not supported as Form or File parameters')
                 continue
             is_body = _contains_struct(parameter.annotation) or any(isinstance(x, Body) for x in metadata)
             if _body_type(parameter.annotation) and not any(isinstance(x, Param) for x in metadata):
@@ -359,6 +406,8 @@ class MsgspecRouter(APIRouter):
                 if remove_request:
                     values.pop(request_name)
                 value = request.scope['_msgspec_body_value']
+                if isinstance(value, RequestValidationError):
+                    raise value
                 values[body.name] = value
             if is_async:
                 result = await endpoint(**values)
@@ -375,7 +424,7 @@ class MsgspecRouter(APIRouter):
                     # Typed decoding validates fields and Meta, even for existing Structs.
                     result = output_decoder.decode(output_encoder.encode(result))
                 except (TypeError, ValueError, OverflowError) as exc:
-                    raise ResponseValidationError([{'loc': ('response',), 'msg': str(exc), 'type': 'value_error.msgspec'}]) from exc
+                    result = _revalidate_without_json(result, output_type, exc)
             status_code = sub_response.status_code or kwargs.get('status_code') or 200
             if untyped_encoder is not None:
                 response = Response(untyped_encoder.encode(result), status_code=status_code,
