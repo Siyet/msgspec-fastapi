@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "msgspec-fastapi"
-version = "0.0.2"
+version = "0.0.3"
 description = "Experimental FastAPI router that decodes request bodies and encodes responses with msgspec"
 readme = "README.md"
 license = "BSD-3-Clause"
