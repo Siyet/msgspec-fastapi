@@ -6,7 +6,7 @@ increased throughput by 68% on a route with a large JSON body and by 11% to 13% 
 database-backed routes; see the Benchmarks section below.
 
 This is a prototype. Its API may change, and it relies on private FastAPI internals, so
-it is pinned to FastAPI 0.142.2 to 0.146.x. It is a personal project, not part of
+it is pinned to FastAPI 0.142.2 to 0.147.x. It is a personal project, not part of
 msgspec; feedback is welcome in the issues.
 
 ## Installation
