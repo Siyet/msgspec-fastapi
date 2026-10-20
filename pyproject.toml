@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "msgspec-fastapi"
-version = "0.0.3"
+version = "0.0.4"
 description = "Experimental FastAPI router that decodes request bodies and encodes responses with msgspec"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -27,9 +27,22 @@ Issues = "https://github.com/Siyet/msgspec-fastapi/issues"
 
 [dependency-groups]
 test = ["pytest", "httpx", "httpx2", "python-multipart"]
+lint = ["ruff==0.17.0", "pre-commit>=4.5,<5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/msgspec_fastapi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "ANN"]
+# Runtime type expressions, JSON values and forwarded FastAPI options are dynamic.
+ignore = ["ANN401"]
+
+[tool.ruff.format]
+quote-style = "single"

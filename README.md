@@ -164,5 +164,14 @@ Things to keep in mind:
 ## Development
 
 ```sh
+uv sync --group test --group lint
 uv run --group test pytest
+uv run --group lint ruff check .
+uv run --group lint ruff format --check .
+uv run --group lint pre-commit install
+uv run --group lint pre-commit run --all-files
 ```
+
+Ruff checks imports, annotations and common Python errors, and formats the code.
+CI runs the same Ruff version as the pre-commit hooks. Test endpoints that exercise the absence
+of a response annotation intentionally omit it.

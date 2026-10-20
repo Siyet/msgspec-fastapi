@@ -2,5 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 dist/
 uv.lock
