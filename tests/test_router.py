@@ -344,9 +344,10 @@ def test_parameters_are_validated_with_msgspec(prefix: str) -> None:
     assert next(p for p in parameters if p['name'] == 'max')['schema']['minimum'] == 1
 
 
-def test_install_openapi_requires_routers() -> None:
-    with pytest.raises(TypeError):
-        install_openapi(FastAPI())
+def test_install_openapi_accepts_no_router_arguments() -> None:
+    app = FastAPI()
+    install_openapi(app)
+    assert app.openapi()['paths'] == {}
 
 
 @pytest.mark.parametrize(

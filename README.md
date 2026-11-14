@@ -38,7 +38,7 @@ async def create_city(city: City) -> City:
 
 app = FastAPI()
 app.include_router(router)
-install_openapi(app, router)
+install_openapi(app)
 ```
 
 ## Benchmarks
@@ -142,9 +142,13 @@ Things to keep in mind:
   so coercion differs for some inputs (for example, `" 1.5"` is rejected for `float`
   and `"nan"` is accepted for `Decimal`). Parameter types must be supported by msgspec;
   Pydantic-specific types such as `AnyUrl` raise `TypeError` at route registration.
-- `install_openapi` adds the msgspec JSON schemas to the OpenAPI document. It is required
-  for a valid document: call it once after including the routers, passing every
-  `MsgspecRouter` that is not included directly in another `MsgspecRouter`.
+- `install_openapi(app)` adds the msgspec JSON schemas to the OpenAPI document. Call it
+  once before serving. Routes, webhooks and callbacks are discovered from the application
+  when the document is built; the optional router arguments remain accepted for
+  compatibility. Hidden routes do not add msgspec components. As in FastAPI, the document
+  is cached: set `app.openapi_schema = None` to rebuild it after adding routes.
+- Body descriptions and examples, `openapi_extra` request metadata and response examples
+  are preserved. JSON body routes document their 400, 415 and 422 responses.
 - A Pydantic body or response model is left to FastAPI; the route parameters are still
   validated with msgspec.
 

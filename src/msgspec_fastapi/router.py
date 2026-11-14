@@ -10,14 +10,16 @@ from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints
 import msgspec
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi._compat import ModelField
-from fastapi.datastructures import DefaultPlaceholder
+from fastapi.datastructures import DefaultPlaceholder, _Unset
 from fastapi.dependencies.models import Dependant
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.openapi.utils import validation_error_definition, validation_error_response_definition
 from fastapi.params import Body, Depends, Form, Param
 from fastapi.routing import APIRoute, _effective_route_context_var, iter_route_contexts
+from fastapi.utils import deep_dict_update
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from starlette.routing import compile_path
 
 from .responses import MsgspecJSONResponse
 from .validation import (
@@ -61,14 +63,6 @@ def _merge_components(target: dict[str, Any], incoming: dict[str, Any]) -> None:
         if name in target and target[name] != schema:
             raise ValueError(f'Conflicting OpenAPI component: {name}')
         target[name] = deepcopy(schema)
-
-
-def _schema(annotation: Any, components: dict[str, Any]) -> dict[str, Any]:
-    (schema,), definitions = msgspec.json.schema_components(
-        [annotation], ref_template='#/components/schemas/{name}'
-    )
-    _merge_components(components, definitions)
-    return schema
 
 
 def _json_type(annotation: Any) -> bool:
@@ -168,6 +162,9 @@ class MsgspecRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         context = _effective_route_context_var.get()
         route = context if context is not None and context.original_route is self else self
+        body_parameter = getattr(self.endpoint, '_msgspec_body_parameter', None)
+        if body_parameter in compile_path(route.path)[2]:
+            raise AssertionError('Path parameters must be scalar values')
         prepare_parameters(route.dependant)
         handler = super().get_route_handler()
         config = getattr(self.endpoint, '_msgspec_body_config', None)
@@ -190,39 +187,103 @@ class MsgspecRoute(APIRoute):
         return handle
 
 
+def _rename_schema_refs(schema: dict[str, Any], names: dict[str, str]) -> None:
+    if '$ref' in schema:
+        schema['$ref'] = names.get(schema['$ref'], schema['$ref'])
+    mapping = schema.get('discriminator', {}).get('mapping', {})
+    for key, ref in mapping.items():
+        mapping[key] = names.get(ref, ref)
+    # Visit schema positions only; defaults, examples and property names are data.
+    for key in ('properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas'):
+        for child in schema.get(key, {}).values():
+            if isinstance(child, dict):
+                _rename_schema_refs(child, names)
+    for key in (
+        'items',
+        'additionalProperties',
+        'unevaluatedProperties',
+        'propertyNames',
+        'contains',
+        'not',
+        'if',
+        'then',
+        'else',
+        'unevaluatedItems',
+        'contentSchema',
+    ):
+        child = schema.get(key)
+        if isinstance(child, dict):
+            _rename_schema_refs(child, names)
+    for key in ('anyOf', 'oneOf', 'allOf', 'prefixItems'):
+        for child in schema.get(key, []):
+            if isinstance(child, dict):
+                _rename_schema_refs(child, names)
+
+
 def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
-    """Install once after including routers, before serving the application."""
-    if not routers:
-        raise TypeError('Pass the MsgspecRouter instances included in the app')
+    """Install once before serving; router arguments are kept for compatibility."""
     if getattr(app, '_msgspec_openapi_installed', False):
         raise RuntimeError('msgspec OpenAPI is already installed')
     # FastAPI builds included contexts lazily; validate them before serving.
     list(iter_route_contexts(app.routes))
+    list(iter_route_contexts(app.webhooks.routes))
     original = app.openapi
     app.openapi_schema = None
 
     def openapi() -> dict[str, Any]:
-        document = original()
+        if app.openapi_schema is not None:
+            return app.openapi_schema
+        document = deepcopy(original())
+        # Do not retain a partially patched document if schema generation fails.
+        app.openapi_schema = None
         components = document.setdefault('components', {}).setdefault('schemas', {})
-        for router in routers:
-            _merge_components(components, router.msgspec_components)
-        for route in iter_route_contexts(app.routes):
-            original_route = getattr(route, 'original_route', route)
-            if not isinstance(original_route, MsgspecRoute):
-                continue
-            fields: list[ModelField] = []
+        targets: list[tuple[Any, dict[str, Any]]] = []
 
-            def collect(dependant: Dependant) -> None:
-                for group in ('path_params', 'query_params', 'header_params', 'cookie_params'):
-                    fields.extend(getattr(dependant, group))
-                for dependency in dependant.dependencies:
-                    collect(dependency)
+        def collect_fields(dependant: Dependant) -> list[ModelField]:
+            fields = []
+            for group in ('path_params', 'query_params', 'header_params', 'cookie_params'):
+                fields.extend(getattr(dependant, group))
+            for dependency in dependant.dependencies:
+                fields.extend(collect_fields(dependency))
+            return fields
 
-            collect(route.dependant)
-            for method in route.methods or ():
-                operation = (
-                    document.get('paths', {}).get(route.path_format, {}).get(method.lower(), {})
+        def collect(routes: Any, paths: dict[str, Any]) -> None:
+            operations = {}
+            for route in iter_route_contexts(routes):
+                if isinstance(route.original_route, APIRoute) and route.include_in_schema:
+                    for method in route.methods or ():
+                        operations[route.path_format, method.lower()] = route
+            for (path, method), route in operations.items():
+                operation = paths.get(path, {}).get(method)
+                if operation is None:
+                    continue
+                body_type, output_type, output_code = getattr(
+                    route.endpoint, '_msgspec_openapi', (None, None, None)
                 )
+                if body_type is not None:
+                    targets.append(
+                        (
+                            body_type,
+                            operation['requestBody']['content']['application/json']['schema'],
+                        )
+                    )
+                    _merge_components(
+                        components,
+                        {
+                            'HTTPValidationError': validation_error_response_definition,
+                            'ValidationError': validation_error_definition,
+                        },
+                    )
+                if output_type is not None:
+                    targets.append(
+                        (
+                            output_type,
+                            operation['responses'][str(output_code)]['content']['application/json'][
+                                'schema'
+                            ],
+                        )
+                    )
+                fields = collect_fields(route.dependant)
                 for parameter in operation.get('parameters', []):
                     for field in fields:
                         if (
@@ -230,11 +291,56 @@ def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
                             and parameter['in'] == cast(Param, field.field_info).in_.value
                             and parameter['name'] == field.alias
                         ):
-                            schema = deepcopy(getattr(field, '_msgspec_schema'))
-                            for key in ('title', 'description', 'default'):
-                                if key in parameter.get('schema', {}):
-                                    schema[key] = parameter['schema'][key]
+                            # Replace the Pydantic schema, preserving field metadata.
+                            previous = parameter.get('schema', {})
+                            schema = {
+                                key: previous[key]
+                                for key in ('title', 'description', 'default')
+                                if key in previous
+                            }
                             parameter['schema'] = schema
+                            targets.append((getattr(field, '_msgspec_type'), schema))
+                callbacks = {
+                    callback.name: callback
+                    for callback in route.callbacks or ()
+                    if isinstance(callback, APIRoute)
+                }
+                for callback in callbacks.values():
+                    callback_paths = operation.get('callbacks', {}).get(callback.name, {})
+                    collect([callback], callback_paths)
+
+        collect(app.routes, document.get('paths', {}))
+        collect(app.webhooks.routes, document.get('webhooks', {}))
+        if targets:
+            schemas, definitions = msgspec.json.schema_components(
+                [annotation for annotation, _ in targets],
+                ref_template='#/components/schemas/{name}',
+            )
+            # Pydantic and msgspec can use the same short name for different schemas.
+            reserved = set(components) | set(definitions)
+            names = {}
+            for name in definitions:
+                if name in components:
+                    candidate = name + '_Msgspec'
+                    while candidate in reserved:
+                        candidate += '_'
+                    reserved.add(candidate)
+                    names['#/components/schemas/' + name] = '#/components/schemas/' + candidate
+            for schema in (*schemas, *definitions.values()):
+                _rename_schema_refs(schema, names)
+            definitions = {
+                names.get('#/components/schemas/' + name, '#/components/schemas/' + name).rsplit(
+                    '/', 1
+                )[-1]: schema
+                for name, schema in definitions.items()
+            }
+            _merge_components(components, definitions)
+            for (_, target), schema in zip(targets, schemas):
+                schema = deepcopy(schema)
+                deep_dict_update(schema, target)
+                target.clear()
+                target.update(schema)
+        app.openapi_schema = document
         return document
 
     setattr(app, 'openapi', openapi)
@@ -250,12 +356,6 @@ class MsgspecRouter(APIRouter):
         if not issubclass(kwargs['route_class'], MsgspecRoute):
             raise TypeError('route_class must extend MsgspecRoute')
         super().__init__(*args, **kwargs)
-        self.msgspec_components: dict[str, Any] = {}
-
-    def include_router(self, router: APIRouter, *args: Any, **kwargs: Any) -> None:
-        if isinstance(router, MsgspecRouter):
-            _merge_components(self.msgspec_components, router.msgspec_components)
-        return super().include_router(router, *args, **kwargs)
 
     def add_api_route(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
         override = kwargs.get('route_class_override')
@@ -318,6 +418,7 @@ class MsgspecRouter(APIRouter):
             if serializes_untyped_output
             else None
         )
+        path_parameters = compile_path(path)[2]
         body = None
         body_meta = None
         for parameter in parameters:
@@ -335,6 +436,8 @@ class MsgspecRouter(APIRouter):
             if _body_type(parameter.annotation) and not any(isinstance(x, Param) for x in metadata):
                 is_body = True
             if is_body and _json_type(parameter.annotation):
+                if parameter.name in path_parameters:
+                    raise AssertionError('Path parameters must be scalar values')
                 if any(isinstance(x, Param) for x in metadata):
                     raise TypeError(
                         'msgspec Struct query/path/header/cookie parameters are not supported'
@@ -377,12 +480,12 @@ class MsgspecRouter(APIRouter):
             kwargs['response_model'] = None
             kwargs['response_class'] = MsgspecJSONResponse
 
-        components: dict[str, Any] = {}
         responses = deepcopy(kwargs.get('responses') or {})
         openapi_extra = deepcopy(kwargs.get('openapi_extra') or {})
         default = inspect.Signature.empty
         decoder = None
         embedded = False
+        decode_type = None
         if body is not None:
             metadata = (
                 [x for x in get_args(body.annotation)[1:] if not isinstance(x, Body)]
@@ -413,21 +516,32 @@ class MsgspecRouter(APIRouter):
                     raise TypeError('Body default_factory is not supported')
             else:
                 default = body.default
+            field_schema: dict[str, Any] = {}
+            if body_meta is not None:
+                for key in ('title', 'description', 'examples', 'deprecated'):
+                    value = getattr(body_meta, key)
+                    if value is not None:
+                        field_schema[key] = value
+                if body_meta.json_schema_extra:
+                    if not isinstance(body_meta.json_schema_extra, dict):
+                        raise TypeError('Body json_schema_extra must be a dict')
+                    deep_dict_update(field_schema, body_meta.json_schema_extra)
             decode_type = body_type
             if embedded:
                 assert body_meta is not None
                 # One explicit JSON envelope, preserving a possible Body alias.
+                field_type = Annotated[body_type, msgspec.Meta(extra_json_schema=field_schema)]
                 field = (
-                    ('value', body_type)
+                    ('value', field_type)
                     if default is inspect.Signature.empty
                     else (
                         'value',
-                        body_type,
+                        field_type,
                         msgspec.field(default_factory=lambda: deepcopy(default)),
                     )
                 )
                 identity = {
-                    'schema': msgspec.json.schema(body_type),
+                    'schema': msgspec.json.schema(field_type),
                     'alias': body_meta.alias or body.name,
                     'required': default is inspect.Signature.empty,
                 }
@@ -438,12 +552,21 @@ class MsgspecRouter(APIRouter):
                     name, [field], rename={'value': body_meta.alias or body.name}
                 )
             decoder = msgspec.json.Decoder(type=decode_type)
-            body_schema = _schema(decode_type, components)
-            openapi_extra['requestBody'] = {
+            body_schema = {} if embedded else field_schema
+            media: dict[str, Any] = {'schema': body_schema}
+            if body_meta is not None and not embedded:
+                if body_meta.openapi_examples:
+                    media['examples'] = body_meta.openapi_examples
+                elif body_meta.example is not _Unset:
+                    media['example'] = body_meta.example
+            request_body = {
                 'required': default is inspect.Signature.empty,
-                'content': {'application/json': {'schema': body_schema}},
+                'content': {'application/json': media},
             }
+            deep_dict_update(request_body, openapi_extra.get('requestBody', {}))
+            openapi_extra['requestBody'] = request_body
             responses.setdefault(400, {'description': 'Malformed JSON'})
+            responses.setdefault(415, {'description': 'Unsupported Media Type'})
             responses.setdefault(
                 422,
                 {
@@ -455,13 +578,6 @@ class MsgspecRouter(APIRouter):
                     },
                 },
             )
-            _merge_components(
-                components,
-                {
-                    'HTTPValidationError': validation_error_response_definition,
-                    'ValidationError': validation_error_definition,
-                },
-            )
         if validates_output:
             code = kwargs.get('status_code') or 200
             key = str(code) if str(code) in responses else code
@@ -469,11 +585,9 @@ class MsgspecRouter(APIRouter):
             result_meta.setdefault(
                 'description', kwargs.get('response_description', 'Successful Response')
             )
-            result_meta.setdefault('content', {})['application/json'] = {
-                'schema': _schema(output_type, components)
-            }
-        previous_components = deepcopy(self.msgspec_components)
-        _merge_components(self.msgspec_components, components)
+            result_meta.setdefault('content', {}).setdefault('application/json', {}).setdefault(
+                'schema', {}
+            )
         kwargs['responses'] = responses
         kwargs['openapi_extra'] = openapi_extra
 
@@ -559,8 +673,18 @@ class MsgspecRouter(APIRouter):
             ),
         )
         setattr(wrapper, '_msgspec_prepared', True)
+        setattr(
+            wrapper,
+            '_msgspec_openapi',
+            (
+                decode_type,
+                output_type if validates_output else None,
+                kwargs.get('status_code') or 200,
+            ),
+        )
         if body is not None:
             setattr(wrapper, '_msgspec_body_config', (decoder, default, embedded))
+            setattr(wrapper, '_msgspec_body_parameter', body.name)
         route_count = len(self.routes)
         try:
             result = super().add_api_route(path, wrapper, **kwargs)
@@ -569,5 +693,4 @@ class MsgspecRouter(APIRouter):
             return result
         except Exception:
             del self.routes[route_count:]
-            self.msgspec_components = previous_components
             raise

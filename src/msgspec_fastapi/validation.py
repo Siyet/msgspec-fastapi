@@ -278,10 +278,10 @@ def prepare_parameters(dependant: Dependant) -> None:
                 field.field_info.annotation, field.field_info.metadata
             )
             strict = bool(strict)
-            schema = msgspec.json.schema(target)
+            msgspec.json.schema(target)
 
             field.validate = _parameter_validator(target, strict)
             field._msgspec_parameter = True
-            field._msgspec_schema = schema
+            field._msgspec_type = target
     for dependency in dependant.dependencies:
         prepare_parameters(dependency)
