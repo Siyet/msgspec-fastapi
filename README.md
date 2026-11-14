@@ -5,9 +5,10 @@ In one benchmark service, moving from Pydantic models to msgspec Structs with th
 increased throughput by 68% on a route with a large JSON body and by 11% to 13% on
 database-backed routes; see the Benchmarks section below.
 
-This is a prototype. Its API may change, and it relies on private FastAPI internals, so
-it is pinned to FastAPI 0.142.2 to 0.147.x. It is a personal project, not part of
-msgspec; feedback is welcome in the issues.
+This project uses ZeroVer: the major version will always stay at 0. There will be no
+1.0 release. The API may change in 0.x releases. The router relies on private FastAPI
+internals, so it is pinned to FastAPI 0.142.2 to 0.147.x. It is a personal project,
+not part of msgspec; feedback is welcome in the issues.
 
 ## Installation
 
@@ -54,6 +55,10 @@ is no cache.
 | `POST /cities/validate`, a JSON body of 100 cities (23 KB), no database | 1,610 → 2,703 | **+67.9%** [+67.0%, +68.7%] | 621 → 370 µs | **-40.4%** [-40.7%, -40.1%] |
 | `GET /cities?limit=100`, a page of 100 cities read from PostgreSQL | 514 → 569 | **+10.7%** [+9.9%, +11.5%] | 1,944 → 1,757 µs | **-9.7%** [-10.3%, -9.0%] |
 | `POST /cities/search`, small JSON filter bodies, a page of 100 cities | 447 → 505 | **+12.9%** [+12.1%, +13.7%] | 2,237 → 1,981 µs | **-11.4%** [-12.1%, -10.8%] |
+
+![Throughput: FastAPI with Pydantic versus MsgspecRouter with Structs, with paired relative changes and nominal 95% intervals](docs/images/benchmark-throughput.svg)
+
+![API CPU time per response: FastAPI with Pydantic versus MsgspecRouter with Structs, with paired relative changes and nominal 95% intervals](docs/images/benchmark-cpu.svg)
 
 The first route returns a constant 16-byte response (`{"accepted":100}`), so the
 difference on this route comes mostly from request decoding and validation, and the gain
