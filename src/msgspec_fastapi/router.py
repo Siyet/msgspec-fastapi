@@ -4,7 +4,6 @@ import inspect
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from functools import partial, wraps
-from hashlib import sha256
 from typing import Annotated, Any, cast, get_args, get_origin, get_type_hints
 
 import msgspec
@@ -60,8 +59,10 @@ def _metadata(parameter: inspect.Parameter, annotation: Any) -> list[Any]:
 
 def _merge_components(target: dict[str, Any], incoming: dict[str, Any]) -> None:
     for name, schema in incoming.items():
-        if name in target and target[name] != schema:
-            raise ValueError(f'Conflicting OpenAPI component: {name}')
+        if name in target:
+            if target[name] != schema:
+                raise ValueError(f'Conflicting OpenAPI component: {name}')
+            continue
         target[name] = deepcopy(schema)
 
 
@@ -233,11 +234,12 @@ def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
     def openapi() -> dict[str, Any]:
         if app.openapi_schema is not None:
             return app.openapi_schema
-        document = deepcopy(original())
+        document = original()
         # Do not retain a partially patched document if schema generation fails.
         app.openapi_schema = None
         components = document.setdefault('components', {}).setdefault('schemas', {})
         targets: list[tuple[Any, dict[str, Any]]] = []
+        body_extras: dict[int, tuple[Callable[..., Any], dict[str, Any]]] = {}
 
         def collect_fields(dependant: Dependant) -> list[ModelField]:
             fields = []
@@ -251,8 +253,11 @@ def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
             operations = {}
             for route in iter_route_contexts(routes):
                 if isinstance(route.original_route, APIRoute) and route.include_in_schema:
+                    path = route.path_format
+                    if path is None:
+                        continue
                     for method in route.methods or ():
-                        operations[route.path_format, method.lower()] = route
+                        operations[path, method.lower()] = route
             for (path, method), route in operations.items():
                 operation = paths.get(path, {}).get(method)
                 if operation is None:
@@ -261,10 +266,17 @@ def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
                     route.endpoint, '_msgspec_openapi', (None, None, None)
                 )
                 if body_type is not None:
+                    body_schema = operation['requestBody']['content']['application/json']['schema']
+                    alias = getattr(route.endpoint, '_msgspec_body_alias', None)
+                    if alias is not None:
+                        body_schema = body_schema['properties'][alias]
+                    extra = getattr(route.endpoint, '_msgspec_body_schema_extra', None)
+                    if extra is not None:
+                        body_extras[id(body_schema)] = extra
                     targets.append(
                         (
                             body_type,
-                            operation['requestBody']['content']['application/json']['schema'],
+                            body_schema,
                         )
                     )
                     _merge_components(
@@ -337,6 +349,10 @@ def install_openapi(app: FastAPI, *routers: 'MsgspecRouter') -> None:
             _merge_components(components, definitions)
             for (_, target), schema in zip(targets, schemas):
                 schema = deepcopy(schema)
+                if extra := body_extras.get(id(target)):
+                    callback, metadata = extra
+                    schema.update(metadata)
+                    callback(schema)
                 deep_dict_update(schema, target)
                 target.clear()
                 target.update(schema)
@@ -485,7 +501,8 @@ class MsgspecRouter(APIRouter):
         default = inspect.Signature.empty
         decoder = None
         embedded = False
-        decode_type = None
+        body_alias = None
+        schema_body_type = None
         if body is not None:
             metadata = (
                 [x for x in get_args(body.annotation)[1:] if not isinstance(x, Body)]
@@ -517,43 +534,49 @@ class MsgspecRouter(APIRouter):
             else:
                 default = body.default
             field_schema: dict[str, Any] = {}
+            if embedded and default is not inspect.Signature.empty:
+                field_schema['default'] = msgspec.to_builtins(default, str_keys=True)
             if body_meta is not None:
                 for key in ('title', 'description', 'examples', 'deprecated'):
                     value = getattr(body_meta, key)
                     if value is not None:
                         field_schema[key] = value
-                if body_meta.json_schema_extra:
-                    if not isinstance(body_meta.json_schema_extra, dict):
-                        raise TypeError('Body json_schema_extra must be a dict')
-                    deep_dict_update(field_schema, body_meta.json_schema_extra)
+                if isinstance(body_meta.json_schema_extra, dict):
+                    field_schema.update(body_meta.json_schema_extra)
+                elif body_meta.json_schema_extra is not None and not callable(
+                    body_meta.json_schema_extra
+                ):
+                    raise TypeError('Body json_schema_extra must be a dict or callable')
             decode_type = body_type
             if embedded:
                 assert body_meta is not None
+                body_alias = body_meta.alias or body.name
                 # One explicit JSON envelope, preserving a possible Body alias.
-                field_type = Annotated[body_type, msgspec.Meta(extra_json_schema=field_schema)]
                 field = (
-                    ('value', field_type)
+                    ('value', body_type)
                     if default is inspect.Signature.empty
                     else (
                         'value',
-                        field_type,
+                        body_type,
                         msgspec.field(default_factory=lambda: deepcopy(default)),
                     )
                 )
-                identity = {
-                    'schema': msgspec.json.schema(field_type),
-                    'alias': body_meta.alias or body.name,
-                    'required': default is inspect.Signature.empty,
-                }
-                if default is not inspect.Signature.empty:
-                    identity['default'] = default
-                name = 'MsgspecBody_' + sha256(msgspec.json.encode(identity)).hexdigest()[:16]
                 decode_type = msgspec.defstruct(
-                    name, [field], rename={'value': body_meta.alias or body.name}
+                    'MsgspecBody', [field], rename={'value': body_alias}
                 )
             decoder = msgspec.json.Decoder(type=decode_type)
-            body_schema = {} if embedded else field_schema
-            media: dict[str, Any] = {'schema': body_schema}
+            schema_callback = body_meta.json_schema_extra if body_meta is not None else None
+            schema_body_type = body_type
+            body_schema = {} if callable(schema_callback) else field_schema
+            request_schema = body_schema
+            if body_alias is not None:
+                request_schema = {
+                    'type': 'object',
+                    'properties': {body_alias: body_schema},
+                }
+                if default is inspect.Signature.empty:
+                    request_schema['required'] = [body_alias]
+            media: dict[str, Any] = {'schema': request_schema}
             if body_meta is not None and not embedded:
                 if body_meta.openapi_examples:
                     media['examples'] = body_meta.openapi_examples
@@ -580,8 +603,8 @@ class MsgspecRouter(APIRouter):
             )
         if validates_output:
             code = kwargs.get('status_code') or 200
-            key = str(code) if str(code) in responses else code
-            result_meta = responses.setdefault(key, {})
+            response_key = str(code) if str(code) in responses else code
+            result_meta = responses.setdefault(response_key, {})
             result_meta.setdefault(
                 'description', kwargs.get('response_description', 'Successful Response')
             )
@@ -677,7 +700,7 @@ class MsgspecRouter(APIRouter):
             wrapper,
             '_msgspec_openapi',
             (
-                decode_type,
+                schema_body_type,
                 output_type if validates_output else None,
                 kwargs.get('status_code') or 200,
             ),
@@ -685,6 +708,12 @@ class MsgspecRouter(APIRouter):
         if body is not None:
             setattr(wrapper, '_msgspec_body_config', (decoder, default, embedded))
             setattr(wrapper, '_msgspec_body_parameter', body.name)
+            if body_alias is not None:
+                setattr(wrapper, '_msgspec_body_alias', body_alias)
+            if callable(schema_callback):
+                setattr(
+                    wrapper, '_msgspec_body_schema_extra', (schema_callback, deepcopy(field_schema))
+                )
         route_count = len(self.routes)
         try:
             result = super().add_api_route(path, wrapper, **kwargs)

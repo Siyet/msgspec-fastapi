@@ -499,3 +499,162 @@ def test_embedded_body_metadata_belongs_to_field(router_class: type[APIRouter]) 
         assert field['x-field'] is True
         result = TestClient(app).post(path, json={'number': 12})
         assert result.status_code == 200 and result.json() == 12
+
+
+@pytest.mark.parametrize('router_class', [APIRouter, MsgspecRouter])
+@pytest.mark.parametrize('embedded', [False, True])
+def test_body_schema_callable_matches_fastapi(
+    router_class: type[APIRouter], embedded: bool
+) -> None:
+    router = router_class()
+    calls = []
+
+    def patch(schema: dict[str, Any]) -> None:
+        calls.append(schema.copy())
+        assert schema['type'] == 'integer' and schema['title'] == 'Field title'
+        schema['description'] = 'Callback description'
+        schema['examples'] = [42]
+
+    @router.post(
+        '/items',
+        openapi_extra={
+            'requestBody': {'content': {'application/json': {'schema': {'x-operation': True}}}}
+        },
+    )
+    async def endpoint(
+        item: Annotated[
+            int,
+            Body(
+                embed=embedded,
+                alias='number',
+                title='Field title',
+                description='Original description',
+                json_schema_extra=patch,
+            ),
+        ],
+    ) -> int:
+        return item
+
+    app = FastAPI()
+    app.include_router(router)
+    if router_class is MsgspecRouter:
+        install_openapi(app)
+    assert not calls
+    assert TestClient(app).post('/items', json={'number': 7} if embedded else 7).json() == 7
+    assert not calls
+    document = app.openapi()
+    schema = document['paths']['/items']['post']['requestBody']['content']['application/json'][
+        'schema'
+    ]
+    assert schema['x-operation'] is True
+    field = dereference(document, schema)['properties']['number'] if embedded else schema
+    assert field['description'] == 'Callback description' and field['examples'] == [42]
+    count = len(calls)
+    assert count > 0
+    assert app.openapi() is document and len(calls) == count
+
+
+def test_embedded_schema_callbacks_are_isolated() -> None:
+    router = MsgspecRouter()
+    for path, example in [('/first', 12), ('/second', 24)]:
+
+        def patch(schema: dict[str, Any], value: int = example) -> None:
+            schema['examples'] = [value]
+
+        async def endpoint(item: Annotated[int, Body(embed=True, json_schema_extra=patch)]) -> int:
+            return item
+
+        router.add_api_route(path, endpoint, methods=['POST'])
+    app = FastAPI()
+    app.include_router(router)
+    install_openapi(app)
+    document = app.openapi()
+    assert_local_refs_resolve(document)
+    for path, example in [('/first', 12), ('/second', 24)]:
+        schema = document['paths'][path]['post']['requestBody']['content']['application/json'][
+            'schema'
+        ]
+        assert dereference(document, schema)['properties']['item']['examples'] == [example]
+
+
+@pytest.mark.parametrize('router_class', [APIRouter, MsgspecRouter])
+@pytest.mark.parametrize('embedded', [False, True])
+def test_body_schema_dictionary_extra_overrides_metadata(
+    router_class: type[APIRouter], embedded: bool
+) -> None:
+    router = router_class()
+
+    @router.post('/items')
+    async def endpoint(
+        item: Annotated[
+            int, Body(embed=embedded, examples=[1], json_schema_extra={'examples': [2]})
+        ],
+    ) -> int:
+        return item
+
+    app = FastAPI()
+    app.include_router(router)
+    if router_class is MsgspecRouter:
+        install_openapi(app)
+    document = app.openapi()
+    schema = document['paths']['/items']['post']['requestBody']['content']['application/json'][
+        'schema'
+    ]
+    field = dereference(document, schema)['properties']['item'] if embedded else schema
+    assert field['examples'] == [2]
+
+
+@pytest.mark.parametrize('router_class', [APIRouter, MsgspecRouter])
+def test_optional_embedded_callback_receives_default(router_class: type[APIRouter]) -> None:
+    router = router_class()
+
+    def patch(schema: dict[str, Any]) -> None:
+        schema['examples'] = [schema['default']]
+
+    @router.post('/items')
+    async def endpoint(
+        item: Annotated[int, Body(embed=True, alias='number', json_schema_extra=patch)] = 7,
+    ) -> int:
+        return item
+
+    app = FastAPI()
+    app.include_router(router)
+    if router_class is MsgspecRouter:
+        install_openapi(app)
+    document = app.openapi()
+    body = document['paths']['/items']['post']['requestBody']
+    schema = dereference(document, body['content']['application/json']['schema'])
+    assert not body.get('required') and 'required' not in schema
+    assert schema['properties']['number']['default'] == 7
+    assert schema['properties']['number']['examples'] == [7]
+    assert TestClient(app).post('/items', json={}).json() == 7
+
+
+def test_failed_schema_callback_does_not_cache_partial_document() -> None:
+    attempts = 0
+
+    def patch(schema: dict[str, Any]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            schema['x-partial'] = True
+            raise RuntimeError('Schema callback failed')
+
+    router = MsgspecRouter()
+
+    @router.post('/items')
+    async def endpoint(item: Annotated[int, Body(json_schema_extra=patch)]) -> int:
+        return item
+
+    app = FastAPI()
+    app.include_router(router)
+    install_openapi(app)
+    with pytest.raises(RuntimeError, match='Schema callback failed'):
+        app.openapi()
+    assert app.openapi_schema is None
+    document = app.openapi()
+    schema = document['paths']['/items']['post']['requestBody']['content']['application/json'][
+        'schema'
+    ]
+    assert schema['type'] == 'integer' and 'x-partial' not in schema
+    assert attempts == 2 and app.openapi() is document
