@@ -1,0 +1,151 @@
+name: Build distributions
+
+on:
+  workflow_call:
+    inputs:
+      check-version-tag:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    outputs:
+      filename: ${{ steps.sdist.outputs.filename }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          enable-cache: false
+      - name: Check that the tag matches the version
+        if: inputs.check-version-tag
+        run: test "${GITHUB_REF_NAME#v}" = "$(uv version --short)"
+      - name: Build the source distribution
+        run: uv build --sdist --out-dir dist
+      - name: Check the source distribution
+        run: uvx twine@7.0.0 check --strict dist/*.tar.gz
+      - name: Record the source distribution filename
+        id: sdist
+        shell: bash
+        run: |
+          files=(dist/*.tar.gz)
+          test "${#files[@]}" -eq 1
+          test -f "${files[0]}"
+          echo "filename=${files[0]#dist/}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  wheels:
+    needs: sdist
+    name: Wheels (${{ matrix.id }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x86_64
+            os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+          - id: linux-aarch64
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: aarch64
+          - id: macos-x86_64
+            os: macos-15-intel
+            platform: macos
+            arch: x86_64
+          - id: macos-arm64
+            os: macos-latest
+            platform: macos
+            arch: arm64
+          - id: windows-amd64
+            os: windows-latest
+            platform: windows
+            arch: AMD64
+          - id: windows-arm64
+            os: windows-11-arm
+            platform: windows
+            arch: ARM64
+    env:
+      CIBW_ARCHS: ${{ matrix.arch }}
+      CIBW_PLATFORM: ${{ matrix.platform }}
+      PACKAGE_DIR: dist/${{ needs.sdist.outputs.filename }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: dist-sdist
+          path: dist/
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          enable-cache: false
+      # The CLI avoids the composite action's unpinned nested actions.
+      - name: Build and test wheels
+        if: runner.os != 'Windows'
+        run: uvx --from cibuildwheel==4.2.0 cibuildwheel --output-dir wheelhouse "$PACKAGE_DIR"
+      - name: Build and test wheels (Windows)
+        if: runner.os == 'Windows'
+        run: uvx --from cibuildwheel==4.2.0 cibuildwheel --output-dir wheelhouse "$env:PACKAGE_DIR"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-wheels-${{ matrix.id }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  verify:
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          enable-cache: false
+      - name: Check the distributions
+        run: uvx twine@7.0.0 check --strict dist/*
+      - name: Check native wheel coverage
+        shell: python
+        run: |
+          from pathlib import Path
+          import zipfile
+
+          assert len(list(Path("dist").glob("*.tar.gz"))) == 1
+          wheels = list(Path("dist").glob("*.whl"))
+          assert wheels, "No wheels were built"
+          expected = {
+              ("manylinux", "x86_64"), ("manylinux", "aarch64"),
+              ("musllinux", "x86_64"), ("musllinux", "aarch64"),
+              ("macosx", "x86_64"), ("macosx", "arm64"),
+              ("win", "amd64"), ("win", "arm64"),
+          }
+          found = set()
+          for wheel in wheels:
+              _, python, abi, platforms = wheel.stem.rsplit("-", 3)
+              assert (python, abi) == ("cp311", "abi3"), wheel.name
+              with zipfile.ZipFile(wheel) as archive:
+                  names = archive.namelist()
+                  metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
+                  assert len(metadata) == 1, wheel.name
+                  assert b"Root-Is-Purelib: false" in archive.read(metadata[0]), wheel.name
+                  assert any(
+                      name.startswith("msgspec_fastapi/_defaults.")
+                      and name.endswith((".so", ".pyd"))
+                      for name in names
+                  ), wheel.name
+              for platform in platforms.split("."):
+                  for family, arch in expected:
+                      if platform.startswith(family + "_") and platform.endswith("_" + arch):
+                          found.add((family, arch))
+          assert found == expected, f"Missing wheel platforms: {expected - found}"

@@ -1,0 +1,4 @@
+include LICENSE README.md pyproject.toml setup.py MANIFEST.in
+recursive-include src/msgspec_fastapi *.py *.pyi *.c py.typed
+recursive-include docs *.svg
+recursive-include tests *.py

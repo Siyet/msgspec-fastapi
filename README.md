@@ -16,6 +16,9 @@ not part of msgspec; feedback is welcome in the issues.
 pip install msgspec-fastapi
 ```
 
+The package includes an internal C extension for checking copied defaults and
+metadata. Building from source requires a C11 compiler and CPython headers.
+
 ## Usage
 
 ```python
@@ -120,6 +123,9 @@ Things to keep in mind:
 
 ## What it does
 
+The package uses msgspec for its JSON validation and encoding, without calling Pydantic
+validators or serializers. FastAPI still depends on Pydantic for its own internals.
+
 - A msgspec body parameter (a Struct or another type msgspec can decode) is decoded from
   the raw request bytes by a `msgspec.json.Decoder` built once at route registration. A
   body with a non-JSON content type returns 415, malformed JSON or JSON nested too deeply
@@ -138,15 +144,46 @@ Things to keep in mind:
   instance are not checked. A NaN or infinite value in a `float` field is encoded as
   `null` unless a constraint rejects it. In a `Decimal` field it is encoded as a string,
   while FastAPI with Pydantic rejects non-finite `Decimal` values.
-- Responses of routes without a return annotation or `response_model`, or with
-  `-> None`, are also encoded with msgspec, so the output can differ from FastAPI's
-  `jsonable_encoder` (for example, `bytes` are base64-encoded and `Decimal` is encoded as
-  a string).
+- With the default `MsgspecJSONResponse`, responses of routes without a return
+  annotation or `response_model`, or with `-> None`, are also encoded with msgspec.
+  In addition to msgspec's built-in types, `pathlib` paths and standard-library IP
+  addresses, interfaces and networks are encoded as strings. Other objects, including
+  `BaseModel` instances, `HttpUrl` and `SecretStr`, are unsupported and raise `TypeError`
+  during encoding. Values supported directly by msgspec retain its encoding: for example,
+  `bytes` are base64-encoded and `Decimal` is encoded as a string.
 - Path, query, header and cookie parameters keep FastAPI extraction, aliases and
   defaults, but are converted with `msgspec.convert(strict=False)` instead of Pydantic,
   so coercion differs for some inputs (for example, `" 1.5"` is rejected for `float`
   and `"nan"` is accepted for `Decimal`). Parameter types must be supported by msgspec;
   Pydantic-specific types such as `AnyUrl` raise `TypeError` at route registration.
+- On the msgspec validation path, string `pattern` constraints from FastAPI parameters,
+  `Body` and supported nested `Field` annotations use Rust's `regex` engine through
+  `regexrs-py`, without catastrophic backtracking. Patterns are compiled once at route
+  registration. Compiled Python `re.Pattern` objects are rejected rather than falling
+  back to a backtracking engine.
+  Native `msgspec.Meta(pattern=...)` constraints retain msgspec's Python regex behavior
+  and are outside this protection.
+- Generator endpoints support JSON Lines with the default response class and SSE with
+  `response_class=EventSourceResponse`. Plain yielded items with declared msgspec
+  types are validated with the same instance-trust rules as ordinary responses. Untyped
+  yielded values are also encoded with msgspec. Explicit instances of the exact
+  `ServerSentEvent` class support preformatted `raw_data` and metadata-only events;
+  subclasses are unsupported. A non-`None` `data` payload without
+  `raw_data` is rejected. For a Struct or Raw payload with event metadata, use
+  `ServerSentEvent(raw_data=msgspec.json.encode(payload).decode('utf-8'), id='...')`.
+  Explicit `StreamingResponse` keeps raw chunks. Streaming bodies retain dependency
+  validation and generator cleanup.
+- Custom response classes are supported. Typed response validation and field projection
+  happen before response construction. A `JSONResponse` class that does not inherit
+  `MsgspecJSONResponse` receives JSON-compatible values converted with msgspec, including
+  for untyped returns. Returned `Response` instances pass through unchanged.
+- Structural JSON body errors include field names, encoded aliases, keys and indices,
+  with multiple errors for supported Structs, regular dataclasses, TypedDicts and
+  built-in containers. Diagnostics never repeat model validation hooks or default
+  factories: types with hooks or unsupported diagnostic shapes retain the original
+  first error. The default 422 handler encodes error details with msgspec; custom
+  application exception handlers are preserved. Error details added by dependencies must
+  also be encodable by this encoder or handled by a custom exception handler.
 - `install_openapi(app)` adds the msgspec JSON schemas to the OpenAPI document. Call it
   once before serving. Routes, webhooks and callbacks are discovered from the application
   when the document is built; the optional router arguments remain accepted for
@@ -154,32 +191,43 @@ Things to keep in mind:
   is cached: set `app.openapi_schema = None` to rebuild it after adding routes.
 - Body descriptions and examples, `openapi_extra` request metadata and response examples
   are preserved. JSON body routes document their 400, 415 and 422 responses.
-- A Pydantic body or response model is left to FastAPI; the route parameters are still
-  validated with msgspec.
+- JSON body and response types must be supported by msgspec. Pydantic models and
+  custom Pydantic types are rejected at route registration. Pydantic data objects are
+  also rejected before implicit copies of defaults and route metadata.
 
 ## Limitations
 
 - Only one msgspec body parameter per route, and it cannot be combined with other
   FastAPI body fields. Only JSON bodies are supported: `application/json`,
   `application/*+json`, or a request without a content type when `strict_content_type`
-  is `False`. `Form()` and `File()` parameters are left to FastAPI.
-- When both the parameters and the body are invalid, only the parameter errors are
-  returned; FastAPI returns both.
+  is `False`. JSON body parameters in `Depends` functions are not supported; declare
+  the JSON body on the route endpoint. `Form()` and `File()` parameters are left to FastAPI.
+- On ordinary non-streaming routes, when both the parameters and body are invalid, only
+  the parameter errors are returned; FastAPI returns both.
 - Structs, alone or inside containers, are not supported as path, query, header or
   cookie parameters, or as `Form()` and `File()` parameters.
+- Defaults and copied metadata do not support container subclasses, custom state/reduction
+  methods, registered copy reducers, dynamic attribute access or custom copy descriptors.
+  Ordinary application-defined Python `__deepcopy__` methods and default factories remain
+  application code.
 - `response_model_include`, `response_model_exclude`, `response_model_exclude_*` and
   `response_model_by_alias=False` are rejected for typed msgspec responses.
 
 ## Development
 
 ```sh
-uv sync --group test --group lint
+uv sync --group test --group lint --group typing
 uv run --group test pytest
 uv run --group lint ruff check .
 uv run --group lint ruff format --check .
+uv run --group typing mypy src/msgspec_fastapi --follow-imports=silent
+uv run --group typing python -m mypy.stubtest msgspec_fastapi._defaults
 uv run --group lint pre-commit install
 uv run --group lint pre-commit run --all-files
 ```
+
+After changing C sources, rebuild the extension with
+`uv sync --reinstall-package msgspec-fastapi --group test --group lint --group typing`.
 
 Ruff checks imports, annotations and common Python errors, and formats the code.
 CI runs the same Ruff version as the pre-commit hooks. Test endpoints that exercise the absence
