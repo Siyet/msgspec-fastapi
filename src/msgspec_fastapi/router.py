@@ -777,7 +777,12 @@ class MsgspecRouter(APIRouter):
             decode_type = body_type
             if embedded:
                 assert body_meta is not None
-                body_alias = body_meta.alias or body.name
+                # As in FastAPI, the key read from the request is a string validation_alias,
+                # falling back to alias; AliasChoices and AliasPath do not change it.
+                validation_alias = body_meta.validation_alias
+                if not isinstance(validation_alias, str):
+                    validation_alias = None
+                body_alias = validation_alias or body_meta.alias or body.name
                 # One explicit JSON envelope, preserving a possible Body alias.
                 field = (
                     ('value', body_type)
