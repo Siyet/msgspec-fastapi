@@ -1,6 +1,7 @@
 """Tests for MsgspecRouter request decoding, parameter validation and response encoding."""
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, Generic, TypeVar
 
 import httpx
@@ -427,7 +428,11 @@ def test_request_shapes_match_fastapi(method: str, path: str, options: dict[str,
 
 
 def embedded_alias_app(
-    router_class: type[APIRouter], model: Any, validation_alias: Any, optional: bool
+    router_class: type[APIRouter],
+    model: Any,
+    validation_alias: Any,
+    optional: bool,
+    streaming: bool = False,
 ) -> FastAPI:
     router = router_class()
     body = Body(embed=True, alias='other', validation_alias=validation_alias)
@@ -438,7 +443,11 @@ def embedded_alias_app(
     async def required_body(city: Annotated[model, body]) -> int:
         return city.population
 
-    router.add_api_route('/value', optional_body if optional else required_body, methods=['POST'])
+    async def streaming_body(city: Annotated[model, body]) -> AsyncIterator[int]:
+        yield city.population
+
+    endpoint = streaming_body if streaming else optional_body if optional else required_body
+    router.add_api_route('/value', endpoint, methods=['POST'])
     app = FastAPI()
     app.include_router(router)
     install_openapi(app)
@@ -473,8 +482,9 @@ def test_embedded_body_validation_alias_matches_fastapi(
         ]
 
 
-def test_embedded_body_schema_uses_validation_alias() -> None:
-    app = embedded_alias_app(MsgspecRouter, City, 'key', optional=False)
+@pytest.mark.parametrize('streaming', [False, True])
+def test_embedded_body_schema_uses_validation_alias(streaming: bool) -> None:
+    app = embedded_alias_app(MsgspecRouter, City, 'key', optional=False, streaming=streaming)
     schema = app.openapi()['paths']['/value']['post']['requestBody']['content']['application/json'][
         'schema'
     ]
