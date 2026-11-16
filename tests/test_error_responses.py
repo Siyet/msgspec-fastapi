@@ -12,8 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from pydantic import Field
 
-from msgspec_fastapi import MsgspecRouter
-from msgspec_fastapi.router import MsgspecRoute
+from msgspec_fastapi import MsgspecRoute, MsgspecRouter
 
 
 class Item(msgspec.Struct):

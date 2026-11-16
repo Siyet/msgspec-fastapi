@@ -9,8 +9,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Header
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, create_model
 
-from msgspec_fastapi import MsgspecRouter, install_openapi
-from msgspec_fastapi.router import MsgspecRoute
+from msgspec_fastapi import MsgspecRoute, MsgspecRouter, install_openapi
 
 
 class Choice(str, Enum):
