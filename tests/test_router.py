@@ -1,5 +1,6 @@
 """Tests for MsgspecRouter request decoding, parameter validation and response encoding."""
 
+import asyncio
 from typing import Annotated, Any, Generic, TypeVar
 
 import httpx
@@ -213,23 +214,36 @@ def test_untyped_bodyless_status_keeps_empty_body(status: int) -> None:
 
 
 @pytest.mark.parametrize('nested', [False, True])
-def test_untyped_pydantic_values_use_public_json_aliases(nested: bool) -> None:
-    value = AliasModel(external=1)
+def test_untyped_pydantic_values_are_rejected_without_serialization(nested: bool) -> None:
+    calls = []
+
+    class PrivateModel(BaseModel):
+        internal: int = Field(alias='external')
+        secret: str
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Any:
+            calls.append('model_dump')
+            return {'secret': self.secret}
+
+        def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+            calls.append('model_dump_json')
+            return self.secret
+
+    value = PrivateModel(external=1, secret='must-not-leak')
     result = response(setup({'items': [value]} if nested else value))
-    assert result.status_code == 200
-    assert result.json() == ({'items': [{'external': 1}]} if nested else {'external': 1})
+    assert result.status_code == 500
+    assert calls == []
+    assert 'must-not-leak' not in result.text
 
 
-def test_annotated_pydantic_route_is_still_delegated() -> None:
+def test_annotated_pydantic_response_is_rejected_at_registration() -> None:
     router = MsgspecRouter()
 
-    @router.get('/value')
     async def endpoint() -> PydCity:
         return {'population': -1}
 
-    app = FastAPI()
-    app.include_router(router)
-    assert response(app).status_code == 500
+    with pytest.raises(TypeError, match='Pydantic model behavior is not supported'):
+        router.get('/value')(endpoint)
 
 
 @pytest.mark.parametrize('model', [None, OMITTED])
@@ -459,9 +473,20 @@ def test_deeply_nested_json_body_is_rejected(annotation: Any) -> None:
     app = FastAPI()
     app.include_router(router)
     depth = 200_000
-    result = TestClient(app, raise_server_exceptions=False).post(
-        '/value', content=b'[' * depth + b']' * depth, headers={'Content-Type': 'application/json'}
-    )
+
+    # A small TestClient worker stack can overflow in msgspec before RecursionError.
+    async def post() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url='http://test',
+        ) as client:
+            return await client.post(
+                '/value',
+                content=b'[' * depth + b']' * depth,
+                headers={'Content-Type': 'application/json'},
+            )
+
+    result = asyncio.run(post())
     assert result.status_code == 400
 
 
@@ -560,7 +585,9 @@ def test_body_validation_errors_are_reported_after_dependencies(
     assert calls == [None]
     result = client.post('/value', headers={'token': 'secret'}, **options)
     assert result.status_code == 422
-    assert result.json()['detail'][0]['loc'] == ['body']
+    assert result.json()['detail'][0]['loc'] == (
+        ['body'] if body is None else ['body', 'population']
+    )
 
 
 def test_malformed_body_is_still_rejected_before_dependencies() -> None:
