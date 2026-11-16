@@ -146,7 +146,7 @@ def test_untyped_non_native_values_follow_router_policy(router_class: type[APIRo
     result = TestClient(application(router)).get('/value')
     assert result.status_code == 200
     assert result.json() == {
-        'path': '/tmp/a',
+        'path': str(Path('/tmp/a')),
         'ip': '127.0.0.1',
         'url': 'https://example.com/',
         'secret': '**********',
@@ -1126,7 +1126,7 @@ def test_stdlib_path_and_ip_values_keep_explicit_encoding(mode: str) -> None:
     assert response.status_code == 200
     content = response.text.removeprefix('data: ').strip() if mode == 'sse' else response.text
     assert json.loads(content) == {
-        'path': '/tmp/a',
+        'path': str(Path('/tmp/a')),
         'ip': '::1',
         'interface': '127.0.0.1/8',
         'network': '127.0.0.0/8',

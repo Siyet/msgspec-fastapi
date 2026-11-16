@@ -66,7 +66,7 @@ def test_untyped_selected_json_class_keeps_constructor_and_stdlib_encoding() -> 
         return {'path': Path('/tmp/value')}
 
     result = TestClient(app_for(router)).get('/value')
-    assert result.json() == {'path': '/tmp/value'}
+    assert result.json() == {'path': str(Path('/tmp/value'))}
     assert result.headers['x-selected'] == 'yes'
 
 

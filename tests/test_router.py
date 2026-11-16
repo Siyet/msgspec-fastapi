@@ -1,5 +1,6 @@
 """Tests for MsgspecRouter request decoding, parameter validation and response encoding."""
 
+import asyncio
 from typing import Annotated, Any, Generic, TypeVar
 
 import httpx
@@ -472,9 +473,20 @@ def test_deeply_nested_json_body_is_rejected(annotation: Any) -> None:
     app = FastAPI()
     app.include_router(router)
     depth = 200_000
-    result = TestClient(app, raise_server_exceptions=False).post(
-        '/value', content=b'[' * depth + b']' * depth, headers={'Content-Type': 'application/json'}
-    )
+
+    # A small TestClient worker stack can overflow in msgspec before RecursionError.
+    async def post() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url='http://test',
+        ) as client:
+            return await client.post(
+                '/value',
+                content=b'[' * depth + b']' * depth,
+                headers={'Content-Type': 'application/json'},
+            )
+
+    result = asyncio.run(post())
     assert result.status_code == 400
 
 
