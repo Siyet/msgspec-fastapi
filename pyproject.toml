@@ -14,7 +14,17 @@ authors = [{ name = "Aleksandr Tseluiko" }]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Programming Language :: C",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Typing :: Typed",
 ]
 dependencies = [
     "fastapi>=0.142.2,<0.148",

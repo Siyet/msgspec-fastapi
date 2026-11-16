@@ -7,7 +7,18 @@ import httpx
 import httpx2
 import msgspec
 import pytest
-from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, HTTPException, Query, Response
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+)
 from fastapi.exceptions import ResponseValidationError
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
@@ -356,6 +367,63 @@ def test_parameters_are_validated_with_msgspec(prefix: str) -> None:
     assert client.get(f'{prefix}/value/3', params={'ratio': ' 1.5'}).status_code == 422
     parameters = app.openapi()['paths'][f'{prefix}/value/{{item_id}}']['get']['parameters']
     assert next(p for p in parameters if p['name'] == 'max')['schema']['minimum'] == 1
+
+
+def routes_for_request_shapes(router_class: type[APIRouter], model: Any) -> TestClient:
+    router = router_class()
+
+    @router.post('/sync')
+    def sync(city: model) -> dict[str, Any]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            in_event_loop = False
+        else:
+            in_event_loop = True
+        return {'population': city.population, 'in_event_loop': in_event_loop}
+
+    @router.post('/embedded')
+    async def embedded(city: Annotated[model, Body(embed=True)]) -> model:
+        return city
+
+    @router.post('/optional')
+    async def optional(city: model | None = None) -> dict[str, int | None]:
+        return {'population': None if city is None else city.population}
+
+    @router.get('/list')
+    async def listing(q: Annotated[list[int], Query()] = []) -> list[int]:
+        return q
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+JSON = {'Content-Type': 'application/json'}
+
+
+@pytest.mark.parametrize(
+    'method,path,options',
+    [
+        ('post', '/sync', {'json': {'population': 1}}),
+        ('post', '/sync', {}),
+        ('post', '/sync', {'content': b'', 'headers': JSON}),
+        ('post', '/embedded', {'json': {'city': {'population': 1}}}),
+        ('post', '/embedded', {'json': {'population': 1}}),
+        ('post', '/optional', {}),
+        ('post', '/optional', {'content': b'', 'headers': JSON}),
+        ('post', '/optional', {'json': {'population': 1}}),
+        ('get', '/list?q=1&q=2', {}),
+        ('get', '/list', {}),
+        ('get', '/list?q=1&q=x', {}),
+    ],
+)
+def test_request_shapes_match_fastapi(method: str, path: str, options: dict[str, Any]) -> None:
+    expected = getattr(routes_for_request_shapes(APIRouter, PydCity), method)(path, **options)
+    actual = getattr(routes_for_request_shapes(MsgspecRouter, City), method)(path, **options)
+    assert actual.status_code == expected.status_code
+    if expected.status_code == 200:
+        assert actual.json() == expected.json()
 
 
 def test_install_openapi_accepts_no_router_arguments() -> None:

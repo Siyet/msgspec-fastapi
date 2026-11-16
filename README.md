@@ -204,6 +204,7 @@ validators or serializers. FastAPI still depends on Pydantic for its own interna
   the JSON body on the route endpoint. `Form()` and `File()` parameters are left to FastAPI.
 - On ordinary non-streaming routes, when both the parameters and body are invalid, only
   the parameter errors are returned; FastAPI returns both.
+- A custom `route_class` or `route_class_override` must extend `MsgspecRoute`.
 - Structs, alone or inside containers, are not supported as path, query, header or
   cookie parameters, or as `Form()` and `File()` parameters.
 - Defaults and copied metadata do not support container subclasses, custom state/reduction
