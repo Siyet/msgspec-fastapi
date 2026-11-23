@@ -27,7 +27,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "fastapi>=0.142.2,<0.148",
+    "fastapi>=0.142.2,<0.166",
     "msgspec>=0.22.0",
     "regexrs-py>=0.2.0,<0.3",
 ]

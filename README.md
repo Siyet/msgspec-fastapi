@@ -7,7 +7,7 @@ database-backed routes; see the Benchmarks section below.
 
 This project uses ZeroVer: the major version will always stay at 0. There will be no
 1.0 release. The API may change in 0.x releases. The router relies on private FastAPI
-internals, so it is pinned to FastAPI 0.142.2 to 0.147.x. It is a personal project,
+internals, so it is pinned to FastAPI 0.142.2 to 0.165.x. It is a personal project,
 not part of msgspec; feedback is welcome in the issues.
 
 ## Installation
