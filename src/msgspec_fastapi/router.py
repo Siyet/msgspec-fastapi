@@ -146,6 +146,15 @@ def _decode_json(raw: bytes, decoder: msgspec.json.Decoder[Any], config: _BodyCo
         raise HTTPException(400, 'JSON body is nested too deeply') from exc
 
 
+def _check_encoding(raw: bytes) -> None:
+    """Reject invalid UTF-8, which msgspec does not check in skipped keys and values or Raw."""
+    if not raw.isascii():
+        try:
+            raw.decode()
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
+
+
 def _parse_body(
     request: Request,
     raw: bytes,
@@ -164,9 +173,16 @@ def _parse_body(
     value = _decode_json(raw, decoder, config)
     if isinstance(value, RequestValidationError):
         return value
+    _check_encoding(raw)
     if check_patterns is not None:
         if pattern_needs_raw:
-            parsed = msgspec.json.decode(raw)
+            # The typed decode skips values on which this full decode can still fail.
+            try:
+                parsed = msgspec.json.decode(raw)
+            except msgspec.DecodeError as exc:
+                raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
+            except RecursionError as exc:
+                raise HTTPException(400, 'JSON body is nested too deeply') from exc
             if body_alias is not None and body_alias not in parsed:
                 return value.value
             pattern_value = parsed if body_alias is None else parsed[body_alias]
@@ -229,6 +245,7 @@ def _parse_body_choices(
         return decoded
     values = msgspec.structs.astuple(decoded)
     if first_typed and values[0] is not msgspec.UNSET:
+        _check_encoding(raw)
         return values[0]
     # An absent choice is an empty Raw or UNSET, both false.
     index = next((i for i, value in enumerate(values) if value), 0)

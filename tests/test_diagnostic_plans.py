@@ -80,6 +80,18 @@ def test_unknown_fields_cannot_hide_json_errors(bad: bytes, first: bool) -> None
         assert response.json()['detail'] == f'Malformed JSON body: {error.value}'
 
 
+@pytest.mark.parametrize('value', [b'"\xff"', b'"\xed\xa0\x80"'])
+def test_raw_field_must_be_valid_utf8(value: bytes) -> None:
+    class Item(msgspec.Struct):
+        raw: msgspec.Raw
+
+    response = client(Item).post(
+        '/items', content=b'{"raw": ' + value + b'}', headers={'content-type': 'application/json'}
+    )
+    assert response.status_code == 400
+    assert response.json()['detail'].startswith('Malformed JSON body: ')
+
+
 def test_invalid_earlier_duplicate_field_is_not_accepted() -> None:
     class Item(msgspec.Struct):
         count: int

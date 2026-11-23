@@ -523,6 +523,7 @@ def test_embedded_body_validation_alias_matches_fastapi(
     [
         (b'', 'application/json', 422),
         (b'{"key":', 'application/json', 400),
+        (b'{"key": {"population": 1}, "x": "\xff"}', 'application/json', 400),
         (b'{"key": {"population": 1}}', 'text/plain', 415),
     ],
 )
@@ -856,6 +857,35 @@ def test_body_validation_errors_are_reported_after_dependencies(
     assert result.json()['detail'][0]['loc'] == (
         ['body'] if body is None else ['body', 'population']
     )
+
+
+@pytest.mark.parametrize(
+    ('pattern', 'content'),
+    [
+        (None, b'{"other": "\xff"}'),
+        ('^a', b'{"\xff": 1}'),
+        ('^a', b'{"code": "a\xc3\xa9"}'),
+        ('^a', b'{"other": 1' + b'0' * 5000 + b'}'),
+        ('^a', b'{"other": ' + b'[' * 100000 + b']' * 100000 + b'}'),
+    ],
+    ids=['value', 'pattern-key', 'pattern-valid', 'pattern-long-int', 'pattern-nesting'],
+)
+def test_skipped_body_content_matches_fastapi(pattern: str | None, content: bytes) -> None:
+    async def endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)] = 'az') -> str:
+        return code
+
+    def post(router_class: type[APIRouter]) -> httpx.Response | httpx2.Response:
+        router = router_class()
+        router.add_api_route('/value', endpoint, methods=['POST'])
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app, raise_server_exceptions=False)
+        return client.post('/value', content=content, headers={'Content-Type': 'application/json'})
+
+    expected, actual = post(APIRouter), post(MsgspecRouter)
+    assert actual.status_code == expected.status_code
+    if expected.status_code == 200:
+        assert actual.json() == expected.json()
 
 
 def test_malformed_body_is_still_rejected_before_dependencies() -> None:
