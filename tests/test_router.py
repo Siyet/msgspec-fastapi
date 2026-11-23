@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import re
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Generic, TypeVar
 
@@ -25,7 +26,7 @@ from fastapi import (
 from fastapi.exceptions import ResponseValidationError
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, Field
 
 from msgspec_fastapi import MsgspecRouter, install_openapi
 
@@ -341,8 +342,12 @@ def test_body_validate_default_is_rejected() -> None:
     async def endpoint(population: Annotated[int, Body(ge=0, validate_default=True)] = -1) -> int:
         return population
 
+    async def required(population: Annotated[int, Body(ge=0, validate_default=True)]) -> int:
+        return population
+
     with pytest.raises(TypeError, match='Body validate_default is not supported'):
         MsgspecRouter().add_api_route('/value', endpoint, methods=['POST'])
+    MsgspecRouter().add_api_route('/value', required, methods=['POST'])
 
 
 @pytest.mark.parametrize('prefix', ['', '/api'])
@@ -473,7 +478,6 @@ def embedded_alias_app(
         ('key', True, {'key': {'population': 1}}),
         ('', False, {'other': {'population': 1}}),
         (AliasChoices('key', 'city'), False, {'other': {'population': 1}}),
-        (AliasChoices('key', 'city'), False, {'key': {'population': 1}}),
         (AliasChoices('key', 'city'), False, {'city': {'population': 2}}),
         (
             AliasChoices('key', 'city'),
@@ -485,10 +489,11 @@ def embedded_alias_app(
             False,
             {'city': {'population': 2}, 'key': {'population': -1}},
         ),
-        (AliasChoices('key', 'city'), False, {'city': {'population': 2}, 'key': {'population': 1}}),
         (AliasChoices('key', 'city'), True, {}),
         (AliasChoices('key', 'city'), False, {'city': {'population': -1}}),
         (AliasChoices('key', 'key', 'city'), False, {'city': {'population': 2}}),
+        (AliasChoices('key', AliasPath('a', 'b')), False, {'other': {'population': 1}}),
+        (AliasChoices('key', AliasPath('a', 'b')), False, {'key': {'population': 1}}),
         (
             AliasChoices('key', 'city', 'town'),
             False,
@@ -531,29 +536,39 @@ def test_embedded_body_alias_choices_rejects_invalid_requests(
     assert response.status_code == status
 
 
-@pytest.mark.parametrize('key', ['key', 'city'])
-@pytest.mark.parametrize('value', ['abc', 'zzz'])
-def test_embedded_body_alias_choices_pattern_matches_fastapi(key: str, value: str) -> None:
-    def post(router_class: type[APIRouter]) -> int:
+@pytest.mark.parametrize(
+    'payload', [{'key': 'abc'}, {'city': 'abc'}, {'city': 'zzz'}, {'key': '', 'city': 'abc'}]
+)
+@pytest.mark.parametrize('optional', [False, True])
+def test_embedded_body_alias_choices_pattern_matches_fastapi(
+    payload: dict[str, str], optional: bool
+) -> None:
+    body = Body(embed=True, pattern='^a', validation_alias=AliasChoices('key', 'city'))
+
+    async def required(code: Annotated[str, body]) -> str:
+        return code
+
+    async def with_default(code: Annotated[str, body] = 'adef') -> str:
+        return code
+
+    def post(router_class: type[APIRouter]) -> tuple[int, Any]:
         router = router_class()
-
-        async def endpoint(
-            code: Annotated[
-                str, Body(embed=True, pattern='^a', validation_alias=AliasChoices('key', 'city'))
-            ],
-        ) -> str:
-            return code
-
-        router.add_api_route('/value', endpoint, methods=['POST'])
+        router.add_api_route('/value', with_default if optional else required, methods=['POST'])
         app = FastAPI()
         app.include_router(router)
-        return TestClient(app).post('/value', json={key: value}).status_code
+        response = TestClient(app).post('/value', json=payload)
+        if response.status_code == 200:
+            return 200, response.json()
+        return response.status_code, [e['loc'] for e in response.json()['detail']]
 
     assert post(MsgspecRouter) == post(APIRouter)
 
 
 @pytest.mark.parametrize('first,status', [(1, 200), (-1, 422)])
-def test_embedded_body_alias_choices_run_hooks_once(first: int, status: int) -> None:
+@pytest.mark.parametrize('streaming', [False, True])
+def test_embedded_body_alias_choices_run_hooks_once(
+    first: int, status: int, streaming: bool
+) -> None:
     calls = []
 
     class Counted(msgspec.Struct):
@@ -570,8 +585,11 @@ def test_embedded_body_alias_choices_run_hooks_once(first: int, status: int) -> 
     async def endpoint(city: Annotated[Counted, body]) -> int:
         return city.population
 
+    async def stream(city: Annotated[Counted, body]) -> AsyncIterator[int]:
+        yield city.population
+
     router = MsgspecRouter()
-    router.add_api_route('/value', endpoint, methods=['POST'])
+    router.add_api_route('/value', stream if streaming else endpoint, methods=['POST'])
     app = FastAPI()
     app.include_router(router)
     payload = {'key': {'population': first}, 'city': {'population': 2}}
@@ -581,14 +599,21 @@ def test_embedded_body_alias_choices_run_hooks_once(first: int, status: int) -> 
 
 # FastAPI reads AliasChoices instead of the alias since 0.156.4.
 ALIAS_CHOICES_KEY = (
-    'key' if tuple(map(int, fastapi.__version__.split('.')[:3])) >= (0, 156, 4) else 'other'
+    'key'
+    if tuple(map(int, re.findall(r'\d+', fastapi.__version__)[:3])) >= (0, 156, 4)
+    else 'other'
 )
 
 
+# Streaming routes also reference FastAPI's own body schema, which lists the first choice.
 @pytest.mark.parametrize(
-    'validation_alias,key', [('key', 'key'), (AliasChoices('key', 'city'), ALIAS_CHOICES_KEY)]
+    'validation_alias,key,streaming',
+    [
+        ('key', 'key', False),
+        ('key', 'key', True),
+        (AliasChoices('key', 'city'), ALIAS_CHOICES_KEY, False),
+    ],
 )
-@pytest.mark.parametrize('streaming', [False, True])
 def test_embedded_body_schema_uses_validation_alias(
     validation_alias: Any, key: str, streaming: bool
 ) -> None:

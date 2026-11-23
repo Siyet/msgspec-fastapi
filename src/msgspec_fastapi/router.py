@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, MutableMapping
 from functools import partial, wraps
 from typing import Annotated, Any, NamedTuple, cast, get_args, get_origin, get_type_hints
@@ -56,7 +57,7 @@ class _BodyConfig(NamedTuple):
 
 _BODY_UNDEFINED = inspect.signature(Body).parameters['default'].default
 # FastAPI 0.156.4 and later read an embedded body by its AliasChoices instead of the alias.
-_READS_ALIAS_CHOICES = tuple(map(int, fastapi_version.split('.')[:3])) >= (0, 156, 4)
+_READS_ALIAS_CHOICES = tuple(map(int, re.findall(r'\d+', fastapi_version)[:3])) >= (0, 156, 4)
 
 
 def _contains_struct(annotation: Any) -> bool:
@@ -810,7 +811,7 @@ class MsgspecRouter(APIRouter):
                     default = body.default
                 if body_meta.default_factory is not None:
                     raise TypeError('Body default_factory is not supported')
-                if body_meta.validate_default:
+                if body_meta.validate_default and default is not inspect.Signature.empty:
                     raise TypeError('Body validate_default is not supported')
             else:
                 default = body.default
@@ -1125,7 +1126,7 @@ class MsgspecRouter(APIRouter):
                         diagnose=compile_json_body_errors(decode_type),
                     )
 
-                # Pattern checks need the selected key's raw value, so then every choice is raw.
+                # Pattern checks need the selected key's raw value, so with them every choice is raw.
                 first_typed = check_patterns is None
                 choices_type = msgspec.defstruct(
                     'MsgspecBodyChoices',
