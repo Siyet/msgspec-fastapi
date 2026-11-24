@@ -148,15 +148,17 @@ def _decode_json(raw: bytes, decoder: msgspec.json.Decoder[Any], config: _BodyCo
 
 
 _ENCODING_CHUNK_SIZE = 1 << 14
+_ENCODING_CHUNKING_THRESHOLD = 1 << 16
 
 
 def _check_encoding(raw: bytes) -> None:
     """Reject invalid UTF-8, which msgspec does not check in skipped keys and values or Raw."""
     if raw.isascii():
         return
-    if len(raw) > _ENCODING_CHUNK_SIZE:
-        # Decoding in chunks keeps the temporary strings small. An error is reported
-        # from the full decode below, so its position counts from the start of the body.
+    if len(raw) > _ENCODING_CHUNKING_THRESHOLD:
+        # Decoding in chunks keeps the temporary strings small. Smaller bodies are
+        # decoded at once, which is usually faster. An error is reported from the full
+        # decode below, so its position counts from the start of the body.
         decoder = codecs.getincrementaldecoder('utf-8')()
         view = memoryview(raw)
         try:

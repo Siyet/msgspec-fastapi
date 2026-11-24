@@ -890,7 +890,8 @@ def test_body_validation_errors_are_reported_after_dependencies(
         ('^a', False, b'{"code": "a\xc3\xa9"}'),
         ('^a', False, b'{"other": 1' + b'0' * 5000 + b'}'),
         ('^a', True, b'{"code": "abc", "other": "\xff"}'),
-        (None, False, b'{"other": "' + b'a' * (16384 - 11) + b'\xff"}'),
+        (None, False, b'{"other": "' + b'a' * (65536 - 12) + b'\xc3\xa9"}'),
+        (None, False, b'{"other": "' + b'a' * (65536 - 11) + b'\xff"}'),
     ],
     ids=[
         'value',
@@ -898,6 +899,7 @@ def test_body_validation_errors_are_reported_after_dependencies(
         'pattern-valid',
         'pattern-long-int',
         'pattern-required',
+        'long-valid',
         'long-value',
     ],
 )
