@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, MutableMapping
 from functools import partial, wraps
 from typing import Annotated, Any, NamedTuple, cast, get_args, get_origin, get_type_hints
@@ -9,6 +10,7 @@ from weakref import WeakValueDictionary
 import anyio
 import msgspec
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import __version__ as fastapi_version
 from fastapi.datastructures import DefaultPlaceholder, _Unset
 from fastapi.dependencies.models import Dependant
 from fastapi.dependencies.utils import get_stream_item_type
@@ -24,6 +26,7 @@ from fastapi.routing import (
 )
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi.utils import deep_dict_update
+from pydantic import AliasChoices
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from starlette.responses import JSONResponse
 from starlette.routing import compile_path
@@ -53,6 +56,8 @@ class _BodyConfig(NamedTuple):
 
 
 _BODY_UNDEFINED = inspect.signature(Body).parameters['default'].default
+# FastAPI 0.156.4 and later read an embedded body by its AliasChoices instead of the alias.
+_READS_ALIAS_CHOICES = tuple(map(int, re.findall(r'\d+', fastapi_version)[:3])) >= (0, 156, 4)
 
 
 def _contains_struct(annotation: Any) -> bool:
@@ -103,6 +108,44 @@ def _hints(endpoint: Callable[..., Any]) -> dict[str, Any]:
     return get_type_hints(target, include_extras=True)
 
 
+def _check_content_type(request: Request, strict_content_type: bool) -> None:
+    content_type = request.headers.get('content-type')
+    if content_type:
+        media_type = content_type.split(';')[0].strip().lower()
+        if media_type != 'application/json' and not (
+            media_type.startswith('application/') and media_type.endswith('+json')
+        ):
+            raise HTTPException(415, 'Expected a JSON request body')
+    elif strict_content_type:
+        # Like FastAPI's strict_content_type: a body without a content type can be sent
+        # cross-origin without a CORS preflight, so it is not parsed as JSON.
+        raise HTTPException(415, 'Expected a JSON request body')
+
+
+def _decode_json(raw: bytes, decoder: msgspec.json.Decoder[Any], config: _BodyConfig) -> Any:
+    """Decode a JSON body, returning the errors of an invalid value as config reports them."""
+    try:
+        return decoder.decode(raw)
+    except msgspec.ValidationError as exc:
+        # Typed decoding can stop on a field error before discovering invalid syntax.
+        try:
+            if config.diagnose is not None:
+                errors = config.diagnose(raw)
+            else:
+                errors = body_errors(msgspec.json.decode(raw), config.decoder.type)
+        except (msgspec.DecodeError, UnicodeError) as syntax:
+            raise HTTPException(400, f'Malformed JSON body: {syntax}') from syntax
+        except RecursionError as nested:
+            raise HTTPException(400, 'JSON body is nested too deeply') from nested
+        return RequestValidationError(
+            errors or [{'loc': ('body',), 'msg': str(exc), 'type': 'value_error.msgspec'}]
+        )
+    except (msgspec.DecodeError, UnicodeError) as exc:
+        raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
+    except RecursionError as exc:
+        raise HTTPException(400, 'JSON body is nested too deeply') from exc
+
+
 def _parse_body(
     request: Request,
     raw: bytes,
@@ -117,37 +160,10 @@ def _parse_body(
                 [{'loc': ('body',), 'msg': 'Field required', 'type': 'missing'}]
             )
         return copy_body_default(default)
-    content_type = request.headers.get('content-type')
-    if content_type:
-        media_type = content_type.split(';')[0].strip().lower()
-        if media_type != 'application/json' and not (
-            media_type.startswith('application/') and media_type.endswith('+json')
-        ):
-            raise HTTPException(415, 'Expected a JSON request body')
-    elif strict_content_type:
-        # Like FastAPI's strict_content_type: a body without a content type can be sent
-        # cross-origin without a CORS preflight, so it is not parsed as JSON.
-        raise HTTPException(415, 'Expected a JSON request body')
-    try:
-        value = decoder.decode(raw)
-    except msgspec.ValidationError as exc:
-        # Typed decoding can stop on a field error before discovering invalid syntax.
-        try:
-            if diagnose is not None:
-                errors = diagnose(raw)
-            else:
-                errors = body_errors(msgspec.json.decode(raw), decoder.type)
-        except (msgspec.DecodeError, UnicodeError) as syntax:
-            raise HTTPException(400, f'Malformed JSON body: {syntax}') from syntax
-        except RecursionError as nested:
-            raise HTTPException(400, 'JSON body is nested too deeply') from nested
-        return RequestValidationError(
-            errors or [{'loc': ('body',), 'msg': str(exc), 'type': 'value_error.msgspec'}]
-        )
-    except (msgspec.DecodeError, UnicodeError) as exc:
-        raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
-    except RecursionError as exc:
-        raise HTTPException(400, 'JSON body is nested too deeply') from exc
+    _check_content_type(request, strict_content_type)
+    value = _decode_json(raw, decoder, config)
+    if isinstance(value, RequestValidationError):
+        return value
     if check_patterns is not None:
         if pattern_needs_raw:
             parsed = msgspec.json.decode(raw)
@@ -186,6 +202,40 @@ def _revalidate_without_json(result: Any, output_type: Any, error: Exception) ->
     raise ResponseValidationError(
         [{'loc': ('response',), 'msg': str(error), 'type': 'value_error.msgspec'}]
     ) from error
+
+
+def _parse_body_choices(
+    request: Request,
+    raw: bytes,
+    strict_content_type: bool,
+    configs: list[_BodyConfig | None],
+    choices: msgspec.json.Decoder[Any],
+    first_typed: bool,
+    later_config: Callable[[int], _BodyConfig],
+) -> Any:
+    """Decode the first AliasChoices key present in the body, as FastAPI does.
+
+    The choices are read as raw JSON. When first_typed, the first choice is decoded in the
+    same pass: it is selected whenever it is present, so model hooks run only once. The
+    configurations of later choices are built when a request first selects them.
+    """
+    first = configs[0]
+    assert first is not None
+    if not raw:
+        return _parse_body(request, raw, first, strict_content_type)
+    _check_content_type(request, strict_content_type)
+    decoded = _decode_json(raw, choices, first)
+    if isinstance(decoded, RequestValidationError):
+        return decoded
+    values = msgspec.structs.astuple(decoded)
+    if first_typed and values[0] is not msgspec.UNSET:
+        return values[0]
+    # An absent choice is an empty Raw or UNSET, both false.
+    index = next((i for i, value in enumerate(values) if value), 0)
+    config = configs[index]
+    if config is None:
+        config = configs[index] = later_config(index)
+    return _parse_body(request, raw, config, strict_content_type)
 
 
 async def _body_error_response(request: Request, exc: RequestValidationError) -> Response:
@@ -279,6 +329,8 @@ class MsgspecRoute(APIRoute):
                 dependency_overrides_provider=route.dependency_overrides_provider,
                 embed_body_fields=route._embed_body_fields,
                 strict_content_type=route.strict_content_type,
+                # FastAPI 0.165 added route form limits.
+                **({'form_limits': self.form_limits} if hasattr(self, 'form_limits') else {}),
                 stream_item_field=cast(Any, _StreamItemField(*stream_callbacks)),
                 is_json_stream=route.is_json_stream,
             )
@@ -339,12 +391,18 @@ class MsgspecRoute(APIRoute):
             strict_content_type = strict_content_type.value
 
         handler = build_native_handler()
+        # A streamed body is validated by FastAPI, which reads AliasChoices itself.
+        choices = (
+            getattr(self.endpoint, '_msgspec_body_choices', None) if stream_body is None else None
+        )
 
         async def handle(request: Request) -> Response:
             # A body that is not JSON is rejected before dependency side effects.
             raw = await request.body()
-            request.scope['_msgspec_body_value'] = _parse_body(
-                request, raw, config, strict_content_type
+            request.scope['_msgspec_body_value'] = (
+                _parse_body(request, raw, config, strict_content_type)
+                if choices is None
+                else _parse_body_choices(request, raw, strict_content_type, *choices)
             )
             response = await handler(request)
             return response
@@ -725,6 +783,7 @@ class MsgspecRouter(APIRouter):
         decoder = None
         embedded = False
         body_alias = None
+        body_aliases: list[str] = []
         schema_body_type = None
         if body is not None:
             metadata = (
@@ -752,6 +811,8 @@ class MsgspecRouter(APIRouter):
                     default = body.default
                 if body_meta.default_factory is not None:
                     raise TypeError('Body default_factory is not supported')
+                if body_meta.validate_default and default is not inspect.Signature.empty:
+                    raise TypeError('Body validate_default is not supported')
             else:
                 default = body.default
             if default is not inspect.Signature.empty:
@@ -777,12 +838,20 @@ class MsgspecRouter(APIRouter):
             decode_type = body_type
             if embedded:
                 assert body_meta is not None
-                # As in FastAPI, the key read from the request is a string validation_alias,
-                # falling back to alias; AliasChoices and AliasPath do not change it.
+                # As in FastAPI, the request key is a string validation_alias or, since
+                # FastAPI 0.156.4, the first AliasChoices key present in the body. Otherwise,
+                # including when a choice is an AliasPath, it is the alias or the parameter name.
                 validation_alias = body_meta.validation_alias
-                if not isinstance(validation_alias, str):
-                    validation_alias = None
-                body_alias = validation_alias or body_meta.alias or body.name
+                choices = (
+                    validation_alias.choices
+                    if isinstance(validation_alias, AliasChoices) and _READS_ALIAS_CHOICES
+                    else [validation_alias or None]
+                )
+                if all(isinstance(choice, str) for choice in choices):
+                    body_aliases = list(dict.fromkeys(cast(list[str], choices)))
+                else:
+                    body_aliases = [body_meta.alias or body.name]
+                body_alias = body_aliases[0]
                 # One explicit JSON envelope, preserving a possible Body alias.
                 field = (
                     ('value', body_type)
@@ -1036,18 +1105,45 @@ class MsgspecRouter(APIRouter):
             pattern_needs_raw = patterns_need_raw(body_type) or (
                 body_alias is not None and default is not inspect.Signature.empty
             )
-            setattr(
-                prepared_endpoint,
-                '_msgspec_body_config',
-                _BodyConfig(
-                    decoder,
-                    default,
-                    body_alias,
-                    pattern_validator(body_type, strings_validated=not pattern_needs_raw),
-                    pattern_needs_raw,
-                    self._body_error_check(decoder.type),
-                ),
+            check_patterns = pattern_validator(body_type, strings_validated=not pattern_needs_raw)
+            config = _BodyConfig(
+                decoder,
+                default,
+                body_alias,
+                check_patterns,
+                pattern_needs_raw,
+                self._body_error_check(decoder.type),
             )
+            setattr(prepared_endpoint, '_msgspec_body_config', config)
+            if len(body_aliases) > 1:
+
+                def later_config(index: int) -> _BodyConfig:
+                    alias = body_aliases[index]
+                    decode_type = msgspec.defstruct('MsgspecBody', [field], rename={'value': alias})
+                    return config._replace(
+                        decoder=msgspec.json.Decoder(type=decode_type),
+                        alias=alias,
+                        diagnose=compile_json_body_errors(decode_type),
+                    )
+
+                # Pattern checks need the selected key's raw value, so with them every choice is raw.
+                first_typed = check_patterns is None
+                choices_type = msgspec.defstruct(
+                    'MsgspecBodyChoices',
+                    [
+                        (f'key{i}', msgspec.Raw, msgspec.Raw())
+                        if i or not first_typed
+                        else (f'key{i}', body_type | msgspec.UnsetType, msgspec.UNSET)
+                        for i in range(len(body_aliases))
+                    ],
+                    rename={f'key{i}': alias for i, alias in enumerate(body_aliases)},
+                )
+                configs: list[_BodyConfig | None] = [config] + [None] * (len(body_aliases) - 1)
+                setattr(
+                    prepared_endpoint,
+                    '_msgspec_body_choices',
+                    (configs, msgspec.json.Decoder(type=choices_type), first_typed, later_config),
+                )
             setattr(prepared_endpoint, '_msgspec_body_parameter', body.name)
             if is_generator:
                 setattr(

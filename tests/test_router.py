@@ -1,9 +1,12 @@
 """Tests for MsgspecRouter request decoding, parameter validation and response encoding."""
 
 import asyncio
+import inspect
+import re
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Generic, TypeVar
 
+import fastapi
 import httpx
 import httpx2
 import msgspec
@@ -23,7 +26,7 @@ from fastapi import (
 from fastapi.exceptions import ResponseValidationError
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.testclient import TestClient
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, Field
 
 from msgspec_fastapi import MsgspecRouter, install_openapi
 
@@ -335,6 +338,18 @@ def test_body_is_decoded_strictly() -> None:
     assert client.post('/value', json={'population': '1'}).status_code == 422
 
 
+def test_body_validate_default_is_rejected() -> None:
+    async def endpoint(population: Annotated[int, Body(ge=0, validate_default=True)] = -1) -> int:
+        return population
+
+    async def required(population: Annotated[int, Body(ge=0, validate_default=True)]) -> int:
+        return population
+
+    with pytest.raises(TypeError, match='Body validate_default is not supported'):
+        MsgspecRouter().add_api_route('/value', endpoint, methods=['POST'])
+    MsgspecRouter().add_api_route('/value', required, methods=['POST'])
+
+
 @pytest.mark.parametrize('prefix', ['', '/api'])
 def test_parameters_are_validated_with_msgspec(prefix: str) -> None:
     router = MsgspecRouter()
@@ -461,8 +476,29 @@ def embedded_alias_app(
         ('key', False, {'key': {'population': -1}}),
         ('key', False, {'other': {'population': 1}}),
         ('key', True, {'key': {'population': 1}}),
+        ('', False, {'other': {'population': 1}}),
         (AliasChoices('key', 'city'), False, {'other': {'population': 1}}),
-        (AliasChoices('key', 'city'), False, {'key': {'population': 1}}),
+        (AliasChoices('key', 'city'), False, {'city': {'population': 2}}),
+        (
+            AliasChoices('key', 'city'),
+            False,
+            {'key': {'population': 1}, 'city': {'population': -1}},
+        ),
+        (
+            AliasChoices('key', 'city'),
+            False,
+            {'city': {'population': 2}, 'key': {'population': -1}},
+        ),
+        (AliasChoices('key', 'city'), True, {}),
+        (AliasChoices('key', 'city'), False, {'city': {'population': -1}}),
+        (AliasChoices('key', 'key', 'city'), False, {'city': {'population': 2}}),
+        (AliasChoices('key', AliasPath('a', 'b')), False, {'other': {'population': 1}}),
+        (AliasChoices('key', AliasPath('a', 'b')), False, {'key': {'population': 1}}),
+        (
+            AliasChoices('key', 'city', 'town'),
+            False,
+            {'town': {'population': 3}, 'city': {'population': 2}},
+        ),
     ],
 )
 def test_embedded_body_validation_alias_matches_fastapi(
@@ -482,13 +518,112 @@ def test_embedded_body_validation_alias_matches_fastapi(
         ]
 
 
+@pytest.mark.parametrize(
+    'content,content_type,status',
+    [
+        (b'', 'application/json', 422),
+        (b'{"key":', 'application/json', 400),
+        (b'{"key": {"population": 1}}', 'text/plain', 415),
+    ],
+)
+def test_embedded_body_alias_choices_rejects_invalid_requests(
+    content: bytes, content_type: str, status: int
+) -> None:
+    app = embedded_alias_app(MsgspecRouter, City, AliasChoices('key', 'city'), optional=False)
+    response = TestClient(app).post(
+        '/value', content=content, headers={'content-type': content_type}
+    )
+    assert response.status_code == status
+
+
+@pytest.mark.parametrize(
+    'payload', [{'key': 'abc'}, {'city': 'abc'}, {'city': 'zzz'}, {'key': '', 'city': 'abc'}]
+)
+@pytest.mark.parametrize('optional', [False, True])
+def test_embedded_body_alias_choices_pattern_matches_fastapi(
+    payload: dict[str, str], optional: bool
+) -> None:
+    body = Body(embed=True, pattern='^a', validation_alias=AliasChoices('key', 'city'))
+
+    async def required(code: Annotated[str, body]) -> str:
+        return code
+
+    async def with_default(code: Annotated[str, body] = 'adef') -> str:
+        return code
+
+    def post(router_class: type[APIRouter]) -> tuple[int, Any]:
+        router = router_class()
+        router.add_api_route('/value', with_default if optional else required, methods=['POST'])
+        app = FastAPI()
+        app.include_router(router)
+        response = TestClient(app).post('/value', json=payload)
+        if response.status_code == 200:
+            return 200, response.json()
+        return response.status_code, [e['loc'] for e in response.json()['detail']]
+
+    assert post(MsgspecRouter) == post(APIRouter)
+
+
+@pytest.mark.parametrize('first,status', [(1, 200), (-1, 422)])
 @pytest.mark.parametrize('streaming', [False, True])
-def test_embedded_body_schema_uses_validation_alias(streaming: bool) -> None:
-    app = embedded_alias_app(MsgspecRouter, City, 'key', optional=False, streaming=streaming)
+def test_embedded_body_alias_choices_run_hooks_once(
+    first: int, status: int, streaming: bool
+) -> None:
+    calls = []
+
+    class Counted(msgspec.Struct):
+        population: int
+
+        def __post_init__(self) -> None:
+            calls.append(self.population)
+            if self.population < 0:
+                raise ValueError('negative')
+
+    # Before FastAPI 0.156.4 the alias is read, so it is the first choice here as well.
+    body = Body(embed=True, alias='key', validation_alias=AliasChoices('key', 'city'))
+
+    async def endpoint(city: Annotated[Counted, body]) -> int:
+        return city.population
+
+    async def stream(city: Annotated[Counted, body]) -> AsyncIterator[int]:
+        yield city.population
+
+    router = MsgspecRouter()
+    router.add_api_route('/value', stream if streaming else endpoint, methods=['POST'])
+    app = FastAPI()
+    app.include_router(router)
+    payload = {'key': {'population': first}, 'city': {'population': 2}}
+    assert TestClient(app).post('/value', json=payload).status_code == status
+    assert len(calls) == 1
+
+
+# FastAPI reads AliasChoices instead of the alias since 0.156.4.
+ALIAS_CHOICES_KEY = (
+    'key'
+    if tuple(map(int, re.findall(r'\d+', fastapi.__version__)[:3])) >= (0, 156, 4)
+    else 'other'
+)
+
+
+# Streaming routes also reference FastAPI's own body schema, which lists the first choice.
+@pytest.mark.parametrize(
+    'validation_alias,key,streaming',
+    [
+        ('key', 'key', False),
+        ('key', 'key', True),
+        (AliasChoices('key', 'city'), ALIAS_CHOICES_KEY, False),
+    ],
+)
+def test_embedded_body_schema_uses_validation_alias(
+    validation_alias: Any, key: str, streaming: bool
+) -> None:
+    app = embedded_alias_app(
+        MsgspecRouter, City, validation_alias, optional=False, streaming=streaming
+    )
     schema = app.openapi()['paths']['/value']['post']['requestBody']['content']['application/json'][
         'schema'
     ]
-    assert list(schema['properties']) == schema['required'] == ['key']
+    assert list(schema['properties']) == schema['required'] == [key]
 
 
 def test_install_openapi_accepts_no_router_arguments() -> None:
@@ -767,6 +902,29 @@ def test_form_and_file_parameters_are_left_to_fastapi() -> None:
     app.include_router(router)
     result = TestClient(app).post('/value', data={'name': 'x'}, files={'data': b'abc'})
     assert result.status_code == 200 and result.json() == {'name': 'x', 'size': 3}
+
+
+@pytest.mark.skipif(
+    'form_limits' not in inspect.signature(APIRouter.add_api_route).parameters,
+    reason='Route form limits were added in FastAPI 0.165.0',
+)
+@pytest.mark.parametrize('streaming', [False, True])
+def test_route_form_limits_apply(streaming: bool) -> None:
+    async def endpoint(a: Annotated[str, Form()], b: Annotated[str, Form()] = '') -> int:
+        return 1
+
+    async def stream(
+        a: Annotated[str, Form()], b: Annotated[str, Form()] = ''
+    ) -> AsyncIterator[int]:
+        yield 1
+
+    router = MsgspecRouter()
+    router.add_api_route(
+        '/value', stream if streaming else endpoint, methods=['POST'], form_limits={'max_fields': 1}
+    )
+    app = FastAPI()
+    app.include_router(router)
+    assert TestClient(app).post('/value', data={'a': 'x', 'b': 'y'}).status_code == 400
 
 
 def test_struct_form_parameter_is_rejected() -> None:
