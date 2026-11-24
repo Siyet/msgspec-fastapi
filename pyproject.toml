@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msgspec-fastapi"
-version = "0.0.4"
-description = "Experimental FastAPI router that decodes request bodies and encodes responses with msgspec"
+version = "0.1.0"
+description = "FastAPI router that decodes request bodies and encodes responses with msgspec"
 readme = "README.md"
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Aleksandr Tseluiko" }]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 4 - Beta",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Programming Language :: C",
