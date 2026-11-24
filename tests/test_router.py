@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import re
+import threading
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Generic, TypeVar
 
@@ -523,6 +524,7 @@ def test_embedded_body_validation_alias_matches_fastapi(
     [
         (b'', 'application/json', 422),
         (b'{"key":', 'application/json', 400),
+        (b'{"key": {"population": 1}, "x": "\xff"}', 'application/json', 400),
         (b'{"key": {"population": 1}}', 'text/plain', 415),
     ],
 )
@@ -758,6 +760,28 @@ def test_deeply_nested_json_body_is_rejected(annotation: Any) -> None:
     assert result.status_code == 400
 
 
+def test_deeply_nested_skipped_value_on_pattern_route() -> None:
+    router = MsgspecRouter()
+
+    @router.post('/value')
+    async def endpoint(value: Annotated[str, Body(embed=True, pattern='^a$')] = 'a') -> str:
+        return value
+
+    app = FastAPI()
+    app.include_router(router)
+    content = b'{"other": ' + b'[' * 100000 + b']' * 100000 + b'}'
+    # On Python 3.14 the maximum nesting depth depends on the thread stack size.
+    previous = threading.stack_size(16 << 20)
+    try:
+        response = TestClient(app).post(
+            '/value', content=content, headers={'Content-Type': 'application/json'}
+        )
+    finally:
+        threading.stack_size(previous)
+    assert response.status_code == 400
+    assert response.json()['detail'] == 'JSON body is nested too deeply'
+
+
 class Reading(msgspec.Struct):
     value: float
 
@@ -856,6 +880,52 @@ def test_body_validation_errors_are_reported_after_dependencies(
     assert result.json()['detail'][0]['loc'] == (
         ['body'] if body is None else ['body', 'population']
     )
+
+
+@pytest.mark.parametrize(
+    ('pattern', 'required', 'content'),
+    [
+        (None, False, b'{"other": "\xff"}'),
+        ('^a', False, b'{"\xff": 1}'),
+        ('^a', False, b'{"code": "a\xc3\xa9"}'),
+        ('^a', False, b'{"other": 1' + b'0' * 5000 + b'}'),
+        ('^a', True, b'{"code": "abc", "other": "\xff"}'),
+        (None, False, b'{"other": "' + b'a' * (65536 - 12) + b'\xc3\xa9"}'),
+        (None, False, b'{"other": "' + b'a' * (65536 - 11) + b'\xff"}'),
+    ],
+    ids=[
+        'value',
+        'pattern-key',
+        'pattern-valid',
+        'pattern-long-int',
+        'pattern-required',
+        'long-valid',
+        'long-value',
+    ],
+)
+def test_skipped_body_content_matches_fastapi(
+    pattern: str | None, required: bool, content: bytes
+) -> None:
+    async def required_endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)]) -> str:
+        return code
+
+    async def endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)] = 'az') -> str:
+        return code
+
+    def post(router_class: type[APIRouter]) -> httpx.Response | httpx2.Response:
+        router = router_class()
+        router.add_api_route(
+            '/value', required_endpoint if required else endpoint, methods=['POST']
+        )
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app, raise_server_exceptions=False)
+        return client.post('/value', content=content, headers={'Content-Type': 'application/json'})
+
+    expected, actual = post(APIRouter), post(MsgspecRouter)
+    assert actual.status_code == expected.status_code
+    if expected.status_code == 200:
+        assert actual.json() == expected.json()
 
 
 def test_malformed_body_is_still_rejected_before_dependencies() -> None:
