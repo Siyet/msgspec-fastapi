@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import inspect
 import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, MutableMapping
@@ -146,13 +147,29 @@ def _decode_json(raw: bytes, decoder: msgspec.json.Decoder[Any], config: _BodyCo
         raise HTTPException(400, 'JSON body is nested too deeply') from exc
 
 
+_ENCODING_CHUNK_SIZE = 1 << 14
+
+
 def _check_encoding(raw: bytes) -> None:
     """Reject invalid UTF-8, which msgspec does not check in skipped keys and values or Raw."""
-    if not raw.isascii():
+    if raw.isascii():
+        return
+    if len(raw) > _ENCODING_CHUNK_SIZE:
+        # Decoding in chunks keeps the temporary strings small. An error is reported
+        # from the full decode below, so its position counts from the start of the body.
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        view = memoryview(raw)
         try:
-            raw.decode()
-        except UnicodeDecodeError as exc:
-            raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
+            for start in range(0, len(raw), _ENCODING_CHUNK_SIZE):
+                decoder.decode(view[start : start + _ENCODING_CHUNK_SIZE])
+            decoder.decode(b'', final=True)
+            return
+        except UnicodeDecodeError:
+            pass
+    try:
+        raw.decode()
+    except UnicodeDecodeError as exc:
+        raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
 
 
 def _parse_body(
@@ -173,13 +190,15 @@ def _parse_body(
     value = _decode_json(raw, decoder, config)
     if isinstance(value, RequestValidationError):
         return value
-    _check_encoding(raw)
+    if check_patterns is None or not pattern_needs_raw:
+        _check_encoding(raw)
     if check_patterns is not None:
         if pattern_needs_raw:
-            # The typed decode skips values on which this full decode can still fail.
+            # The typed decode skips keys and values on which this full decode can still
+            # fail, for example with invalid UTF-8.
             try:
                 parsed = msgspec.json.decode(raw)
-            except msgspec.DecodeError as exc:
+            except (msgspec.DecodeError, UnicodeError) as exc:
                 raise HTTPException(400, f'Malformed JSON body: {exc}') from exc
             except RecursionError as exc:
                 raise HTTPException(400, 'JSON body is nested too deeply') from exc

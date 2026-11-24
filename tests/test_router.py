@@ -883,22 +883,38 @@ def test_body_validation_errors_are_reported_after_dependencies(
 
 
 @pytest.mark.parametrize(
-    ('pattern', 'content'),
+    ('pattern', 'required', 'content'),
     [
-        (None, b'{"other": "\xff"}'),
-        ('^a', b'{"\xff": 1}'),
-        ('^a', b'{"code": "a\xc3\xa9"}'),
-        ('^a', b'{"other": 1' + b'0' * 5000 + b'}'),
+        (None, False, b'{"other": "\xff"}'),
+        ('^a', False, b'{"\xff": 1}'),
+        ('^a', False, b'{"code": "a\xc3\xa9"}'),
+        ('^a', False, b'{"other": 1' + b'0' * 5000 + b'}'),
+        ('^a', True, b'{"code": "abc", "other": "\xff"}'),
+        (None, False, b'{"other": "' + b'a' * (16384 - 11) + b'\xff"}'),
     ],
-    ids=['value', 'pattern-key', 'pattern-valid', 'pattern-long-int'],
+    ids=[
+        'value',
+        'pattern-key',
+        'pattern-valid',
+        'pattern-long-int',
+        'pattern-required',
+        'long-value',
+    ],
 )
-def test_skipped_body_content_matches_fastapi(pattern: str | None, content: bytes) -> None:
+def test_skipped_body_content_matches_fastapi(
+    pattern: str | None, required: bool, content: bytes
+) -> None:
+    async def required_endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)]) -> str:
+        return code
+
     async def endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)] = 'az') -> str:
         return code
 
     def post(router_class: type[APIRouter]) -> httpx.Response | httpx2.Response:
         router = router_class()
-        router.add_api_route('/value', endpoint, methods=['POST'])
+        router.add_api_route(
+            '/value', required_endpoint if required else endpoint, methods=['POST']
+        )
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app, raise_server_exceptions=False)
