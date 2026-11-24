@@ -5,12 +5,22 @@ from typing import Annotated, Any
 
 import msgspec
 import pytest
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from pydantic import Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from msgspec_fastapi import MsgspecRoute, MsgspecRouter
 
@@ -475,7 +485,7 @@ def test_custom_body_bytes_do_not_receive_an_added_truth_check(
 
 @pytest.mark.parametrize('kind', ['model', 'secret'])
 def test_default_error_encoding_never_extracts_pydantic_secrets(kind: str) -> None:
-    from pydantic import BaseModel, SecretStr
+    from pydantic import SecretStr
 
     calls = []
 
@@ -523,3 +533,57 @@ def test_default_error_encoding_never_extracts_pydantic_secrets(kind: str) -> No
     assert response.status_code == 500
     assert calls == []
     assert 'must-not-leak' not in response.text
+
+
+def reject_negative(value: int) -> int:
+    if value < 0:
+        raise ValueError('negative')
+    return value
+
+
+def test_validator_exception_in_error_context_matches_fastapi() -> None:
+    app = FastAPI()
+    for router, path in [(MsgspecRouter(), '/msgspec'), (APIRouter(), '/fastapi')]:
+
+        @router.post(path)
+        async def endpoint(x: Annotated[int, Form(), AfterValidator(reject_negative)]) -> None:
+            pass
+
+        app.include_router(router)
+    client = TestClient(app)
+    expected = client.post('/fastapi', data={'x': '-1'})
+    response = client.post('/msgspec', data={'x': '-1'})
+    assert expected.status_code == 422
+    assert (response.status_code, response.json()) == (expected.status_code, expected.json())
+
+
+class Upload(BaseModel):
+    a: int
+    docs: list[UploadFile]
+
+
+@pytest.mark.parametrize(
+    ('annotation', 'names', 'rendered'),
+    [
+        (Annotated[int, Form()], ['x'], {}),
+        (Annotated[list[UploadFile], File(max_length=1)], ['x', 'x'], [{}, {}]),
+        (Annotated[Upload, Form()], ['docs', 'docs'], {'docs': [{}, {}]}),
+    ],
+)
+def test_files_sent_in_form_are_rendered_as_empty_objects(
+    annotation: Any, names: list[str], rendered: Any
+) -> None:
+    app = FastAPI()
+    for router, path in [(MsgspecRouter(), '/msgspec'), (APIRouter(), '/fastapi')]:
+
+        @router.post(path)
+        async def endpoint(x: annotation) -> None:
+            pass
+
+        app.include_router(router)
+    client = TestClient(app)
+    files = [(name, ('a.txt', b'secret', 'text/plain')) for name in names]
+    expected = client.post('/fastapi', files=files).json()['detail']
+    response = client.post('/msgspec', files=files)
+    assert response.status_code == 422
+    assert response.json()['detail'] == [{**expected[0], 'input': rendered}]
