@@ -535,13 +535,19 @@ def test_default_error_encoding_never_extracts_pydantic_secrets(kind: str) -> No
     assert 'must-not-leak' not in response.text
 
 
-def reject_negative(value: int) -> int:
-    if value < 0:
-        raise ValueError('negative')
-    return value
+class NegativeError(ValueError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.token = 'attribute'
 
 
-def test_validator_exception_in_error_context_matches_fastapi() -> None:
+@pytest.mark.parametrize('error', [ValueError, NegativeError])
+def test_validator_exception_in_error_context_is_rendered_as_empty_object(error: type) -> None:
+    def reject_negative(value: int) -> int:
+        if value < 0:
+            raise error('negative')
+        return value
+
     app = FastAPI()
     for router, path in [(MsgspecRouter(), '/msgspec'), (APIRouter(), '/fastapi')]:
 
@@ -551,10 +557,10 @@ def test_validator_exception_in_error_context_matches_fastapi() -> None:
 
         app.include_router(router)
     client = TestClient(app)
-    expected = client.post('/fastapi', data={'x': '-1'})
+    expected = client.post('/fastapi', data={'x': '-1'}).json()['detail']
     response = client.post('/msgspec', data={'x': '-1'})
-    assert expected.status_code == 422
-    assert (response.status_code, response.json()) == (expected.status_code, expected.json())
+    assert response.status_code == 422
+    assert response.json()['detail'] == [{**expected[0], 'ctx': {'error': {}}}]
 
 
 class Upload(BaseModel):
