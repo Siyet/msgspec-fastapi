@@ -19,6 +19,11 @@ pip install msgspec-fastapi
 The package includes an internal C extension for checking copied defaults and
 metadata. Building from source requires a C11 compiler and CPython headers.
 
+On free-threaded CPython 3.14t the package runs with the GIL enabled: the extension is
+not yet marked as safe to run without it, so importing the package enables the GIL and
+emits a `RuntimeWarning`. Set `PYTHON_GIL=1` to enable the GIL from the start and avoid
+the warning; running with `PYTHON_GIL=0` is not supported.
+
 ## Usage
 
 ```python
