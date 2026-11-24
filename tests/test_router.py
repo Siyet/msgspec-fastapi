@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import re
+import threading
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Generic, TypeVar
 
@@ -759,6 +760,28 @@ def test_deeply_nested_json_body_is_rejected(annotation: Any) -> None:
     assert result.status_code == 400
 
 
+def test_deeply_nested_skipped_value_on_pattern_route() -> None:
+    router = MsgspecRouter()
+
+    @router.post('/value')
+    async def endpoint(value: Annotated[str, Body(embed=True, pattern='^a$')] = 'a') -> str:
+        return value
+
+    app = FastAPI()
+    app.include_router(router)
+    content = b'{"other": ' + b'[' * 100000 + b']' * 100000 + b'}'
+    # On Python 3.14 the maximum nesting depth depends on the thread stack size.
+    previous = threading.stack_size(16 << 20)
+    try:
+        response = TestClient(app).post(
+            '/value', content=content, headers={'Content-Type': 'application/json'}
+        )
+    finally:
+        threading.stack_size(previous)
+    assert response.status_code == 400
+    assert response.json()['detail'] == 'JSON body is nested too deeply'
+
+
 class Reading(msgspec.Struct):
     value: float
 
@@ -866,9 +889,8 @@ def test_body_validation_errors_are_reported_after_dependencies(
         ('^a', b'{"\xff": 1}'),
         ('^a', b'{"code": "a\xc3\xa9"}'),
         ('^a', b'{"other": 1' + b'0' * 5000 + b'}'),
-        ('^a', b'{"other": ' + b'[' * 100000 + b']' * 100000 + b'}'),
     ],
-    ids=['value', 'pattern-key', 'pattern-valid', 'pattern-long-int', 'pattern-nesting'],
+    ids=['value', 'pattern-key', 'pattern-valid', 'pattern-long-int'],
 )
 def test_skipped_body_content_matches_fastapi(pattern: str | None, content: bytes) -> None:
     async def endpoint(code: Annotated[str, Body(embed=True, pattern=pattern)] = 'az') -> str:
