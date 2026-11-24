@@ -51,7 +51,7 @@ where = ["src"]
 msgspec_fastapi = ["*.pyi", "py.typed"]
 
 [tool.cibuildwheel]
-build = "cp3{11,12,13,14}-*"
+build = "cp3{11,12,13,14}-* cp314t-*"
 skip = "*-manylinux_i686 *-musllinux_i686 *-win32"
 test-requires = ["pytest", "httpx", "httpx2", "python-multipart", "tzdata; sys_platform == 'win32'"]
 test-command = "pytest {project}/tests"

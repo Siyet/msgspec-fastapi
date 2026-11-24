@@ -1,4 +1,3 @@
-#define Py_LIMITED_API 0x030b0000
 #include <Python.h>
 
 #define COPIER_POLICY_FIELDS(X)                                                                    \
@@ -28,7 +27,7 @@ typedef struct {
     Copier *owner;
     PyObject *memo;
 } Context;
-static PyObject *clone(Context *, PyObject *);
+static PyObject *clone_value(Context *, PyObject *);
 
 static void replace_owned(PyObject **slot, PyObject *next) {
     PyObject *old = *slot;
@@ -92,7 +91,7 @@ static PyObject *clone_list(Context *c, PyObject *x) {
     for (Py_ssize_t i = 0; i < PyList_Size(x); i++) {
         PyObject *next = Py_NewRef(PyList_GetItem(x, i));
         replace_owned(&item, next);
-        PyObject *value = clone(c, item);
+        PyObject *value = clone_value(c, item);
         if (value == NULL)
             goto failed;
         int status = PyList_Append(out, value);
@@ -116,7 +115,7 @@ static PyObject *clone_tuple(Context *c, PyObject *x) {
     int changed = 0;
     for (Py_ssize_t i = 0; i < n; i++) {
         PyObject *item = PyTuple_GetItem(x, i);
-        PyObject *value = clone(c, item);
+        PyObject *value = clone_value(c, item);
         if (value == NULL) {
             Py_DECREF(out);
             return NULL;
@@ -168,8 +167,8 @@ static PyObject *clone_dict(Context *c, PyObject *x) {
         replace_owned(&key_local, next_key);
         replace_owned(&value_local, next_value);
         Py_DECREF(pair);
-        PyObject *value = clone(c, value_local);
-        PyObject *key = value == NULL ? NULL : clone(c, key_local);
+        PyObject *value = clone_value(c, value_local);
+        PyObject *key = value == NULL ? NULL : clone_value(c, key_local);
         if (key == NULL) {
             Py_XDECREF(value);
             goto failed;
@@ -347,7 +346,7 @@ static PyObject *construct(Context *c, CopyFrame *frame) {
     if (copied == NULL)
         return NULL;
     for (Py_ssize_t i = 0; i < PyTuple_Size(args); i++) {
-        PyObject *value = clone(c, PyTuple_GetItem(args, i));
+        PyObject *value = clone_value(c, PyTuple_GetItem(args, i));
         if (value == NULL) {
             argument_stopiteration();
             Py_DECREF(copied);
@@ -377,7 +376,7 @@ static PyObject *reconstruct_state(Context *c, CopyFrame *frame) {
     state.y = construct(c, frame);
     if (state.y == NULL)
         goto done;
-    PyObject *copied_state = clone(c, state.state);
+    PyObject *copied_state = clone_value(c, state.state);
     if (copied_state == NULL)
         goto done;
     replace_owned(&state.state, copied_state);
@@ -641,7 +640,7 @@ done:;
     return out;
 }
 
-static PyObject *clone(Context *c, PyObject *x) {
+static PyObject *clone_value(Context *c, PyObject *x) {
     if (Py_EnterRecursiveCall(" while copying msgspec defaults"))
         return NULL;
     PyObject *out = clone_impl(c, x);
@@ -675,7 +674,7 @@ static PyObject *copier_copy(Copier *self, PyObject *args) {
         return out;
     }
     Context current = {self, memo};
-    PyObject *out = clone(&current, value);
+    PyObject *out = clone_value(&current, value);
     Py_DECREF(memo);
     return out;
 }

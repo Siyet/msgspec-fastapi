@@ -4,6 +4,7 @@ import copy
 import copyreg
 import dataclasses
 import sys
+import sysconfig
 import weakref
 from collections.abc import Callable
 from typing import Any
@@ -197,6 +198,10 @@ def test_false_reducer_release_follows_next_lookup(
     assert run_case(operation, native_copy, run) == expected
 
 
+@pytest.mark.skipif(
+    bool(sysconfig.get_config_var('Py_GIL_DISABLED')),
+    reason='the deleted hook is released later on free-threaded builds, also with copy.deepcopy',
+)
 @pytest.mark.parametrize('operation', ['direct', 'body', 'metadata'])
 def test_copy_hook_release_follows_memoization(
     native_copy: Callable[..., Any], operation: str

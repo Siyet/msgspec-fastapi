@@ -1,6 +1,3 @@
-#ifndef Py_LIMITED_API
-#define Py_LIMITED_API 0x030b0000
-#endif
 #include <Python.h>
 #include <stdint.h>
 

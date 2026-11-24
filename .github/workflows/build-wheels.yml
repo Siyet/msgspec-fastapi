@@ -130,10 +130,10 @@ jobs:
               ("macosx", "x86_64"), ("macosx", "arm64"),
               ("win", "amd64"), ("win", "arm64"),
           }
-          found = set()
+          found = {("cp311", "abi3"): set(), ("cp314", "cp314t"): set()}
           for wheel in wheels:
               _, python, abi, platforms = wheel.stem.rsplit("-", 3)
-              assert (python, abi) == ("cp311", "abi3"), wheel.name
+              assert (python, abi) in found, wheel.name
               with zipfile.ZipFile(wheel) as archive:
                   names = archive.namelist()
                   metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
@@ -147,5 +147,6 @@ jobs:
               for platform in platforms.split("."):
                   for family, arch in expected:
                       if platform.startswith(family + "_") and platform.endswith("_" + arch):
-                          found.add((family, arch))
-          assert found == expected, f"Missing wheel platforms: {expected - found}"
+                          found[python, abi].add((family, arch))
+          for tag, covered in found.items():
+              assert covered == expected, f"Missing {tag} wheel platforms: {expected - covered}"
