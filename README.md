@@ -187,8 +187,13 @@ validators or serializers. FastAPI still depends on Pydantic for its own interna
   built-in containers. Diagnostics never repeat model validation hooks or default
   factories: types with hooks or unsupported diagnostic shapes retain the original
   first error. The default 422 handler encodes error details with msgspec; custom
-  application exception handlers are preserved. Error details added by dependencies must
-  also be encodable by this encoder or handled by a custom exception handler.
+  application exception handlers are preserved. Exceptions and uploaded files that
+  cannot be encoded with msgspec, such as the exception raised by a validator and stored
+  in `ctx['error']`, or a file in `input`, are rendered as empty objects without their
+  attributes. In FastAPI responses a plain `ValueError` is rendered the same way, but
+  the attributes of uploaded files and custom exceptions are included. Other values in
+  error details, for example ones added by dependencies, must also be encodable by this
+  encoder or handled by a custom exception handler.
 - `install_openapi(app)` adds the msgspec JSON schemas to the OpenAPI document. Call it
   once before serving. Routes, webhooks and callbacks are discovered from the application
   when the document is built; the optional router arguments remain accepted for

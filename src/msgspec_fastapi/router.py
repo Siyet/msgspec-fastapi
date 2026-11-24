@@ -28,6 +28,7 @@ from fastapi.sse import EventSourceResponse, ServerSentEvent
 from fastapi.utils import deep_dict_update
 from pydantic import AliasChoices
 from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette.datastructures import UploadFile
 from starlette.responses import JSONResponse
 from starlette.routing import compile_path
 
@@ -238,8 +239,26 @@ def _parse_body_choices(
     return _parse_body(request, raw, config, strict_content_type)
 
 
+def _error_detail_hook(value: Any) -> Any:
+    # The exception raised by a validator is stored in ctx['error'], and files sent in a
+    # form are UploadFiles in input. They are rendered as empty objects without reading
+    # their attributes, as a plain exception is rendered in FastAPI responses.
+    cls = type(value)
+    if type.__subclasscheck__(BaseException, cls) or type.__subclasscheck__(UploadFile, cls):
+        return {}
+    return _encode_hook(value)
+
+
+_ERROR_ENCODER = msgspec.json.Encoder(enc_hook=_error_detail_hook)
+
+
+class _ErrorResponse(MsgspecJSONResponse):
+    def render(self, content: Any) -> bytes:
+        return _ERROR_ENCODER.encode(content)
+
+
 async def _body_error_response(request: Request, exc: RequestValidationError) -> Response:
-    return MsgspecJSONResponse({'detail': exc.errors()}, status_code=422)
+    return _ErrorResponse({'detail': exc.errors()}, status_code=422)
 
 
 class _BodyErrorHandlers(MutableMapping[Any, Any]):
