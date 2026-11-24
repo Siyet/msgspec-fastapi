@@ -726,7 +726,9 @@ static PyObject *class_info_impl(Guard *self, PyObject *cls) {
     }
     PyObject *namespace = isenum ? self->enum_namespace : Py_None;
     if (!isenum) {
-        if (check_slot_bindings(self, mro, maps) < 0)
+        /* Trusted classes can shadow a base slot with a property, as pathlib does on
+           Python 3.13; their slot values are still checked. */
+        if (!isatomic && check_slot_bindings(self, mro, maps) < 0)
             goto done;
         for (Py_ssize_t i = 0; i < PyTuple_Size(maps); i++) {
             PyObject *mapping = PyTuple_GetItem(maps, i),
@@ -767,7 +769,7 @@ static PyObject *class_info_impl(Guard *self, PyObject *cls) {
             Py_DECREF(name);
             if (PyErr_Occurred())
                 goto done;
-            if (effective != descriptor) {
+            if (effective != descriptor && !isatomic) {
                 PyErr_SetString(PyExc_TypeError, "Shadowed slots are not supported in copied data");
                 goto done;
             }

@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -271,4 +272,43 @@ def test_slot_name_subclass_is_rejected_before_string_callbacks(operation: Any, 
         Slotted.__slotnames__ = [Name('extra')]
     with pytest.raises(TypeError, match='exact strings'):
         operation(original)
+    assert calls == []
+
+
+@pytest.mark.parametrize('operation', [copy_body_default, copy_metadata])
+@pytest.mark.parametrize('path', [Path('a/b'), PureWindowsPath('c:/a')])
+def test_standard_library_paths_are_copied(operation: Any, path: PurePath) -> None:
+    result = operation({'path': path})['path']
+    assert result == path and type(result) is type(path)
+
+
+@pytest.mark.parametrize('operation', [_check_copy_graph, copy_body_default, copy_metadata])
+def test_standard_library_path_slot_values_are_checked(operation: Any) -> None:
+    path = PurePath('a')
+    PurePath.__dict__['_str'].__set__(path, object())
+    with pytest.raises(TypeError, match='Unsupported object'):
+        operation({'path': path})
+
+
+@pytest.mark.parametrize('operation', [_check_copy_graph, copy_body_default, copy_metadata])
+def test_undeclared_slot_shadowed_by_subclass_property_is_rejected(operation: Any) -> None:
+    calls = []
+
+    class Other:
+        __slots__ = ('extra',)
+
+    @dataclasses.dataclass
+    class Record:
+        value: int
+
+    Record.extra = Other.__dict__['extra']
+
+    class Child(Record):
+        @property
+        def extra(self) -> Any:
+            calls.append('getter')
+            return None
+
+    with pytest.raises(TypeError, match='Shadowed slots'):
+        operation(Child(1))
     assert calls == []
